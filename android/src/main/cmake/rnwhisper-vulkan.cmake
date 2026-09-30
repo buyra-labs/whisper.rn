@@ -3,8 +3,9 @@
 # includes this file for that variant.
 #
 # Build host requirements: a host C/C++ compiler (the shader generator runs on
-# the build machine) and a recent glslc (shaderc, or the LunarG Vulkan SDK; the
-# NDK's glslc is too old for ggml's shaders).
+# the build machine) and network access for the Khronos headers. Shaders are
+# compiled with the NDK's glslc, which covers the reduced shader set (it lacks
+# only ggml's optional cooperative-matrix, integer-dot, bf16 and fp8 families).
 include_guard(GLOBAL)
 # Ninja rewrites the shader DEPFILEs relative to the build directory.
 cmake_policy(SET CMP0116 NEW)
@@ -36,9 +37,13 @@ FetchContent_Declare(rnwhisper_spirv_headers
 FetchContent_MakeAvailable(rnwhisper_vulkan_headers rnwhisper_spirv_headers)
 
 find_program(RNWHISPER_GLSLC glslc
-    HINTS "$ENV{VULKAN_SDK}/bin"
-    NO_CMAKE_FIND_ROOT_PATH
-    REQUIRED)
+    HINTS "${ANDROID_NDK}/shader-tools/${ANDROID_HOST_TAG}"
+    NO_DEFAULT_PATH
+    NO_CMAKE_FIND_ROOT_PATH)
+if (NOT RNWHISPER_GLSLC)
+    message(FATAL_ERROR "rnwhisper: no glslc in ${ANDROID_NDK}/shader-tools/${ANDROID_HOST_TAG}")
+endif ()
+message(STATUS "rnwhisper: compiling Vulkan shaders with ${RNWHISPER_GLSLC}")
 # gcc first, like upstream: the NDK's clang is on the search path and cannot
 # build against the host's libstdc++.
 find_program(RNWHISPER_HOST_C_COMPILER NAMES gcc clang NO_CMAKE_FIND_ROOT_PATH REQUIRED)
