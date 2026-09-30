@@ -878,6 +878,17 @@ struct whisper_state {
     whisper_sched sched_cross;
     whisper_sched sched_decode;
 
+    // The last single-token decoder graph, kept allocated in sched_decode and
+    // computed again while its shape (n_tokens, n_kv, ...) is unchanged: the
+    // token position only enters through input tensors.
+    struct {
+        ggml_cgraph * gf = nullptr;
+        int32_t n_tokens = -1;
+        int32_t n_kv = -1;
+        int32_t n_audio_ctx = -1;
+        bool save_alignment_heads_QKs = false;
+    } decoder_graph;
+
     // result of the encoder
     struct ggml_tensor * embd_conv = nullptr;
     struct ggml_tensor * embd_enc  = nullptr;
@@ -1145,8 +1156,14 @@ static void whisper_kv_cache_seq_cp(
 }
 
 static uint32_t whisper_kv_cache_get_padding(const struct whisper_context & wctx) {
-    if (!wctx.params.flash_attn || !wctx.params.use_gpu) {
+    if (!wctx.params.use_gpu) {
         return 1u;
+    }
+
+    // Masked padding cells cost little on a GPU, and a KV length that changes
+    // only every 32 tokens lets the decoder graph be reused in between.
+    if (!wctx.params.flash_attn) {
+        return 32u;
     }
 
 #ifdef GGML_USE_METAL
@@ -2570,7 +2587,6 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
     const int n_audio_ctx_pad = GGML_PAD(n_audio_ctx, 256);
 
     const int32_t n_kv    = worst_case ? n_ctx            : kv_self.n;
-    const int32_t kv_head = worst_case ? n_ctx - n_tokens : kv_self.head;
 
     //WHISPER_LOG_DEBUG("%s: n_past = %d, n_tokens = %d, n_audio_ctx = %d, n_ctx = %d\n", __func__, n_past, n_tokens, n_audio_ctx, n_ctx);
 
@@ -2592,12 +2608,17 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
     ggml_set_name(position, "position");
     ggml_set_input(position);
 
-    // flash-attn: self-attention K/V are written into the cache with SET_ROWS (row kv_head + i <- token i)
-    struct ggml_tensor * kv_idxs = nullptr;
-    if (wctx.params.flash_attn) {
-        kv_idxs = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-        ggml_set_name(kv_idxs, "kv_idxs");
-        ggml_set_input(kv_idxs);
+    // Self-attention K/V are written into the cache with SET_ROWS (row kv_head + i <- token i),
+    // so the graph does not depend on kv_head and can be reused from token to token.
+    // Without flash-attn V is stored transposed and written one element per row (v_idxs).
+    struct ggml_tensor * kv_idxs = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_name(kv_idxs, "kv_idxs");
+    ggml_set_input(kv_idxs);
+    struct ggml_tensor * v_idxs = nullptr;
+    if (!wctx.params.flash_attn) {
+        v_idxs = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens*n_state);
+        ggml_set_name(v_idxs, "v_idxs");
+        ggml_set_input(v_idxs);
     }
 
     const float KQscale = pow(float(n_state_head), -0.25);
@@ -2663,34 +2684,24 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                             Vcur,
                             layer.attn_v_b);
 
-                struct ggml_tensor * k;
-                struct ggml_tensor * v;
+                struct ggml_tensor * k = ggml_view_2d(ctx0, kv_self.k, n_state, n_ctx,
+                        ggml_element_size(kv_self.k)*n_state,
+                        (ggml_element_size(kv_self.k)*n_state)*(il*n_ctx));
+                ggml_build_forward_expand(gf, ggml_set_rows(ctx0, k, Kcur, kv_idxs));
 
                 if (wctx.params.flash_attn) {
-                    k = ggml_view_2d(ctx0, kv_self.k, n_state, n_ctx,
-                            ggml_element_size(kv_self.k)*n_state,
-                            (ggml_element_size(kv_self.k)*n_state)*(il*n_ctx));
-
-                    v = ggml_view_2d(ctx0, kv_self.v, n_state, n_ctx,
+                    struct ggml_tensor * v = ggml_view_2d(ctx0, kv_self.v, n_state, n_ctx,
                             ggml_element_size(kv_self.v)*n_state,
                             (ggml_element_size(kv_self.v)*n_state)*(il*n_ctx));
-                } else {
-                    Vcur = ggml_transpose(ctx0, ggml_reshape_2d(ctx0, Vcur, n_state, n_tokens));
-
-                    k = ggml_view_1d(ctx0, kv_self.k, n_tokens*n_state,
-                            (ggml_element_size(kv_self.k)*n_state)*(il*n_ctx + kv_head));
-
-                    v = ggml_view_2d(ctx0, kv_self.v, n_tokens, n_state,
-                            (   n_ctx)*ggml_element_size(kv_self.v),
-                            (il*n_ctx)*ggml_element_size(kv_self.v)*n_state + kv_head*ggml_element_size(kv_self.v));
-                }
-
-                if (wctx.params.flash_attn) {
-                    ggml_build_forward_expand(gf, ggml_set_rows(ctx0, k, Kcur, kv_idxs));
                     ggml_build_forward_expand(gf, ggml_set_rows(ctx0, v, Vcur, kv_idxs));
                 } else {
-                    ggml_build_forward_expand(gf, ggml_cpy(ctx0, Kcur, k));
-                    ggml_build_forward_expand(gf, ggml_cpy(ctx0, Vcur, v));
+                    // V^T of this layer as rows of one element: element (j, kv_head + i)
+                    // is row j*n_ctx + kv_head + i, and Vcur's element (j, i) is row i*n_state + j.
+                    struct ggml_tensor * v = ggml_view_2d(ctx0, kv_self.v, 1, n_ctx*n_state,
+                            ggml_element_size(kv_self.v),
+                            (il*n_ctx)*ggml_element_size(kv_self.v)*n_state);
+                    ggml_build_forward_expand(gf, ggml_set_rows(ctx0, v,
+                            ggml_reshape_2d(ctx0, Vcur, 1, n_state*n_tokens), v_idxs));
                 }
             }
 
@@ -2988,11 +2999,27 @@ static bool whisper_decode_internal(
     {
         auto & sched = wstate.sched_decode.sched;
 
-        ggml_cgraph * gf = whisper_build_graph_decoder(wctx, wstate, batch, save_alignment_heads_QKs, false);
+        // Reuse the allocated graph when only the inputs differ. The key is what
+        // whisper_build_graph_decoder's shape depends on.
+        static const bool reuse_disabled = getenv("WHISPER_NO_GRAPH_REUSE") != nullptr;
+        auto & cached = wstate.decoder_graph;
+        const int32_t n_audio_ctx = wstate.exp_n_audio_ctx > 0 ? wstate.exp_n_audio_ctx : hparams.n_audio_ctx;
+        ggml_cgraph * gf = nullptr;
+        if (!reuse_disabled && cached.gf != nullptr && cached.n_tokens == n_tokens && cached.n_kv == (int32_t) wstate.kv_self.n &&
+            cached.n_audio_ctx == n_audio_ctx && cached.save_alignment_heads_QKs == save_alignment_heads_QKs) {
+            gf = cached.gf;
+        } else {
+            cached.gf = nullptr;
+            ggml_backend_sched_reset(sched);
+            gf = whisper_build_graph_decoder(wctx, wstate, batch, save_alignment_heads_QKs, false);
 
-        if (!ggml_backend_sched_alloc_graph(sched, gf)) {
-            // should never happen as we pre-allocate the memory
-            return false;
+            if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+                // should never happen as we pre-allocate the memory
+                return false;
+            }
+            if (n_tokens == 1) {
+                cached = { gf, n_tokens, (int32_t) wstate.kv_self.n, n_audio_ctx, save_alignment_heads_QKs };
+            }
         }
 
         // set the inputs
@@ -3002,11 +3029,23 @@ static bool whisper_decode_internal(
         }
 
         {
-            if (wctx.params.flash_attn) {
-                struct ggml_tensor * kv_idxs = ggml_graph_get_tensor(gf, "kv_idxs");
-                std::vector<int32_t> rows(n_tokens);
-                for (int i = 0; i < n_tokens; ++i) { rows[i] = (int32_t) (wstate.kv_self.head + i); }
-                ggml_backend_tensor_set(kv_idxs, rows.data(), 0, ggml_nbytes(kv_idxs));
+            const int32_t kv_head = wstate.kv_self.head;
+            struct ggml_tensor * kv_idxs = ggml_graph_get_tensor(gf, "kv_idxs");
+            std::vector<int32_t> rows(n_tokens);
+            for (int i = 0; i < n_tokens; ++i) { rows[i] = kv_head + i; }
+            ggml_backend_tensor_set(kv_idxs, rows.data(), 0, ggml_nbytes(kv_idxs));
+
+            if (!wctx.params.flash_attn) {
+                const int n_state = hparams.n_text_state;
+                const int n_ctx   = wstate.kv_self.size;
+                struct ggml_tensor * v_idxs = ggml_graph_get_tensor(gf, "v_idxs");
+                std::vector<int32_t> v_rows(n_tokens*n_state);
+                for (int i = 0; i < n_tokens; ++i) {
+                    for (int j = 0; j < n_state; ++j) {
+                        v_rows[i*n_state + j] = j*n_ctx + kv_head + i;
+                    }
+                }
+                ggml_backend_tensor_set(v_idxs, v_rows.data(), 0, ggml_nbytes(v_idxs));
             }
 
             struct ggml_tensor * position = ggml_graph_get_tensor(gf, "position");
@@ -3052,7 +3091,10 @@ static bool whisper_decode_internal(
 
         logits = ggml_graph_node(gf, -1);
 
-        if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+        // The scheduler is reset when the next graph is built, not here, so
+        // that a cached graph stays allocated.
+        if (!ggml_graph_compute_helper(sched, gf, n_threads, cached.gf == nullptr)) {
+            cached.gf = nullptr;
             return false;
         }
     }
