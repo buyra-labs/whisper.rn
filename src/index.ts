@@ -12,6 +12,7 @@ import type {
   NativeVadContextOptions,
   TranscribeOptions,
   TranscribeResult,
+  TranscribeTimings,
   VadOptions,
   VadSegment,
 } from './NativeRNWhisper'
@@ -209,6 +210,7 @@ const emitNativeLog = (level: string, text: string) => {
 export type {
   TranscribeOptions,
   TranscribeResult,
+  TranscribeTimings,
   VadOptions,
   VadSegment,
 }

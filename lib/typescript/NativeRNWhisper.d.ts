@@ -14,6 +14,10 @@ export type TranscribeOptions = {
     maxLen?: number;
     /** Enable token-level timestamps */
     tokenTimestamps?: boolean;
+    /** Decode text only, without timestamp tokens (Default: false) */
+    noTimestamps?: boolean;
+    /** Encoder context in frames, 50 per second of audio (Default: 0, the full 30 s window) */
+    audioCtx?: number;
     /** Enable tinydiarize (requires a tdrz model) */
     tdrzEnable?: boolean;
     /** Word timestamp probability threshold */
@@ -42,6 +46,17 @@ export type TranscribeResult = {
         t1: number;
     }>;
     isAborted: boolean;
+    /** How the transcription spent its time (per-token figures are averages) */
+    timings?: TranscribeTimings;
+};
+export type TranscribeTimings = {
+    totalMs: number;
+    encodeMs: number;
+    decodeMsPerToken: number;
+    batchDecodeMsPerToken: number;
+    promptMsPerToken: number;
+    sampleMsPerToken: number;
+    tokens: number;
 };
 export type CoreMLAsset = {
     uri: string;

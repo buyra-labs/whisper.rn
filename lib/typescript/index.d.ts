@@ -1,11 +1,11 @@
 import './jsi';
-import type { NativeParakeetContext, NativeWhisperContext, NativeWhisperVadContext, TranscribeOptions, TranscribeResult, VadOptions, VadSegment } from './NativeRNWhisper';
+import type { NativeParakeetContext, NativeWhisperContext, NativeWhisperVadContext, TranscribeOptions, TranscribeResult, TranscribeTimings, VadOptions, VadSegment } from './NativeRNWhisper';
 type CoreMLModelAssetOptions = {
     filename: string;
     assets: string[] | number[];
 };
 export declare const installJsi: () => Promise<void>;
-export type { TranscribeOptions, TranscribeResult, VadOptions, VadSegment, };
+export type { TranscribeOptions, TranscribeResult, TranscribeTimings, VadOptions, VadSegment, };
 export type TranscribeNewSegmentsResult = {
     nNew: number;
     totalNNew: number;

@@ -283,11 +283,24 @@ struct SegmentData {
     int t1 = 0;
 };
 
+// How one whisper_full call spent its time, for the app's performance traces.
+// Per-token figures are whisper.cpp's averages (whisper_get_timings).
+struct TranscribeTimings {
+    double totalMs = 0;
+    double encodeMs = 0;
+    double decodeMsPerToken = 0;
+    double batchDecodeMsPerToken = 0;
+    double promptMsPerToken = 0;
+    double sampleMsPerToken = 0;
+    int tokens = 0;
+};
+
 struct TranscribeResultData {
     std::string language;
     std::string result;
     std::vector<SegmentData> segments;
     bool isAborted = false;
+    TranscribeTimings timings;
 };
 
 struct NewSegmentsData {
@@ -883,6 +896,10 @@ TranscribeConfig createTranscribeConfig(
     config.params.translate = getBoolProperty(runtime, options, "translate", false);
     config.params.token_timestamps =
         getBoolProperty(runtime, options, "tokenTimestamps", false);
+    // Text only: no timestamp tokens, which each cost a decode step.
+    config.params.no_timestamps = getBoolProperty(runtime, options, "noTimestamps", false);
+    // Encoder context in frames (50 per second, 0 = the full 30 s window).
+    config.params.audio_ctx = getIntProperty(runtime, options, "audioCtx", config.params.audio_ctx);
     config.params.tdrz_enable = getBoolProperty(runtime, options, "tdrzEnable", false);
     config.tdrzEnable = config.params.tdrz_enable;
     config.params.max_len = getIntProperty(runtime, options, "maxLen", config.params.max_len);
@@ -1332,6 +1349,34 @@ std::vector<float> readWaveAudio(const std::string &pathOrBase64) {
     return decodeWaveBytes(rnwhisper_jsi::hostLoadFileBytes(pathOrBase64));
 }
 
+// Runs whisper_full_parallel and records how long it took, whisper.cpp's per-stage averages and the number of decoded tokens.
+int runWhisperFull(
+    whisper_context *context,
+    whisper_full_params params,
+    const std::vector<float> &audio,
+    int nProcessors,
+    bool gpu,
+    TranscribeTimings &timings) {
+    whisper_reset_timings(context);
+    (void)gpu;
+    const auto started = std::chrono::steady_clock::now();
+    const int code = whisper_full_parallel(context, params, audio.data(), static_cast<int>(audio.size()), nProcessors);
+    timings.totalMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    if (whisper_timings *stages = whisper_get_timings(context)) {
+        timings.encodeMs = stages->encode_ms;
+        timings.decodeMsPerToken = stages->decode_ms;
+        timings.batchDecodeMsPerToken = stages->batchd_ms;
+        timings.promptMsPerToken = stages->prompt_ms;
+        timings.sampleMsPerToken = stages->sample_ms;
+        delete stages;
+    }
+    timings.tokens = 0;
+    for (int segment = 0; segment < whisper_full_n_segments(context); segment++) {
+        timings.tokens += whisper_full_n_tokens(context, segment);
+    }
+    return code;
+}
+
 std::vector<SegmentData> readSegments(
     whisper_context *context,
     int start,
@@ -1434,6 +1479,15 @@ jsi::Value createTranscribeResultValue(
         jsi::String::createFromUtf8(runtime, data.result));
     result.setProperty(runtime, "segments", createSegmentsArray(runtime, data.segments));
     result.setProperty(runtime, "isAborted", jsi::Value(data.isAborted));
+    jsi::Object timings(runtime);
+    timings.setProperty(runtime, "totalMs", jsi::Value(data.timings.totalMs));
+    timings.setProperty(runtime, "encodeMs", jsi::Value(data.timings.encodeMs));
+    timings.setProperty(runtime, "decodeMsPerToken", jsi::Value(data.timings.decodeMsPerToken));
+    timings.setProperty(runtime, "batchDecodeMsPerToken", jsi::Value(data.timings.batchDecodeMsPerToken));
+    timings.setProperty(runtime, "promptMsPerToken", jsi::Value(data.timings.promptMsPerToken));
+    timings.setProperty(runtime, "sampleMsPerToken", jsi::Value(data.timings.sampleMsPerToken));
+    timings.setProperty(runtime, "tokens", jsi::Value(data.timings.tokens));
+    result.setProperty(runtime, "timings", timings);
     return result;
 }
 
@@ -1973,12 +2027,14 @@ void installJSIBindings(
                         throw JsiError("Failed to create transcription job");
                     }
 
-                    int code = whisper_full_parallel(
+                    TranscribeTimings timings;
+                    int code = runWhisperFull(
                         holder->context,
                         job->params,
-                        audio.data(),
-                        static_cast<int>(audio.size()),
-                        config.nProcessors);
+                        audio,
+                        config.nProcessors,
+                        holder->gpu,
+                        timings);
                     bool isAborted = job->is_aborted();
                     rnwhisper::job_remove(config.jobId);
 
@@ -1990,6 +2046,7 @@ void installJSIBindings(
                         holder->context,
                         config.tdrzEnable,
                         isAborted);
+                    result.timings = timings;
                     return [result](jsi::Runtime &rt) {
                         return createTranscribeResultValue(rt, result);
                     };
@@ -2090,12 +2147,14 @@ void installJSIBindings(
                         throw JsiError("Failed to create transcription job");
                     }
 
-                    int code = whisper_full_parallel(
+                    TranscribeTimings timings;
+                    int code = runWhisperFull(
                         holder->context,
                         job->params,
-                        audio.data(),
-                        static_cast<int>(audio.size()),
-                        config.nProcessors);
+                        audio,
+                        config.nProcessors,
+                        holder->gpu,
+                        timings);
                     bool isAborted = job->is_aborted();
                     rnwhisper::job_remove(config.jobId);
 
@@ -2107,6 +2166,7 @@ void installJSIBindings(
                         holder->context,
                         config.tdrzEnable,
                         isAborted);
+                    result.timings = timings;
                     return [result](jsi::Runtime &rt) {
                         return createTranscribeResultValue(rt, result);
                     };
