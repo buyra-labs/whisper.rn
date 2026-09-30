@@ -2232,6 +2232,12 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
 
                 struct ggml_tensor * KQ_soft_max = ggml_soft_max_ext(ctx0, KQ, nullptr, KQscale, 0.0f);
 
+                // The product with V (itype) converts the probabilities anyway; as a
+                // node of its own, a backend can fuse the cast into the softmax.
+                if (wctx.itype == GGML_TYPE_F16) {
+                    KQ_soft_max = ggml_cast(ctx0, KQ_soft_max, GGML_TYPE_F16);
+                }
+
                 struct ggml_tensor * V =
                     ggml_cast(ctx0,
                             ggml_permute(ctx0,
