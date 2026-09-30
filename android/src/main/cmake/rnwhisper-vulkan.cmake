@@ -118,8 +118,12 @@ function(rnwhisper_add_vulkan_backend target)
         ${rnwhisper_spirv_headers_SOURCE_DIR}/include
         ${CMAKE_CURRENT_BINARY_DIR}
     )
+    # GGML_BACKEND_* export the backend API (the JNI wrapper calls
+    # ggml_backend_vk_set_pipeline_cache_path); the core is built with hidden
+    # visibility otherwise.
     target_compile_definitions(${target} PRIVATE
         GGML_USE_VULKAN
+        GGML_BACKEND_SHARED GGML_BACKEND_BUILD
         GGML_VK_SHADER_TYPES="${RNWHISPER_VULKAN_SHADER_TYPES}"
         GGML_VK_NO_FLASH_ATTN
     )
