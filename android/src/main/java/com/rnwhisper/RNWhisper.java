@@ -1,6 +1,13 @@
 package com.rnwhisper;
 
 import android.content.Context;
+import android.content.pm.PackageManager;
+import android.opengl.EGL14;
+import android.opengl.EGLConfig;
+import android.opengl.EGLContext;
+import android.opengl.EGLDisplay;
+import android.opengl.EGLSurface;
+import android.opengl.GLES20;
 import android.os.Build;
 import android.util.Log;
 
@@ -13,6 +20,7 @@ import java.io.FileReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.Locale;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class RNWhisper {
@@ -57,6 +65,130 @@ public class RNWhisper {
     }
   }
 
+  /** Accelerators a variant can carry; see {@link #acceleration}. */
+  public static final String ACCELERATION_HEXAGON = "hexagon";
+  public static final String ACCELERATION_VULKAN = "vulkan";
+  public static final String ACCELERATION_CPU = "cpu";
+
+  private static String acceleration;
+  private static String gpuName;
+
+  /**
+   * The accelerator of the variant this device loads: {@link #ACCELERATION_HEXAGON}
+   * on Snapdragon SoCs whose NPU ggml-hexagon supports, {@link #ACCELERATION_VULKAN}
+   * on the GPUs the Vulkan variant is tuned for (see {@link #isVulkanGpuSupported}),
+   * otherwise {@link #ACCELERATION_CPU}. Loading follows this choice, so an app can
+   * use it to decide what to run before loading anything.
+   */
+  public static synchronized String acceleration(Context context) {
+    if (acceleration == null) {
+      acceleration = detectAcceleration(context);
+      Log.i(TAG, "Acceleration: " + acceleration + (gpuName != null ? " (" + gpuName + ")" : ""));
+    }
+    return acceleration;
+  }
+
+  /** The GPU's name (GL_RENDERER) when it was probed, else null. */
+  public static synchronized String gpuName(Context context) {
+    acceleration(context);
+    return gpuName;
+  }
+
+  private static String detectAcceleration(Context context) {
+    if (!isArm64V8a()) {
+      return ACCELERATION_CPU;
+    }
+    String cpuFeatures = getCpuFeatures();
+    boolean hasFp16 = cpuFeatures.contains("fp16") || cpuFeatures.contains("fphp");
+    if (!hasFp16) {
+      return ACCELERATION_CPU;
+    }
+    if (isHexagonSupported()) {
+      return ACCELERATION_HEXAGON;
+    }
+    if (hasVulkan11(context)) {
+      gpuName = glRenderer();
+      if (isVulkanGpuSupported(gpuName)) {
+        return ACCELERATION_VULKAN;
+      }
+    }
+    return ACCELERATION_CPU;
+  }
+
+  // The Vulkan variant's ggml backend runs on Vulkan 1.2 devices and on 1.1
+  // devices that expose the promoted 1.2 features as extensions (Mali-G78 in a
+  // Galaxy S21 reports 1.1). The system feature carries the device's version.
+  private static final int VULKAN_1_1 = 0x401000;
+
+  private static boolean hasVulkan11(Context context) {
+    return context.getPackageManager()
+      .hasSystemFeature(PackageManager.FEATURE_VULKAN_HARDWARE_VERSION, VULKAN_1_1);
+  }
+
+  private static final Pattern MALI_PATTERN = Pattern.compile("^Mali-G(\\d+)");
+
+  /**
+   * Arm Mali GPUs of the Valhall architecture and later (Mali-G57/G68/G77/G78,
+   * G310 and up, Mali-G1, Immortalis): 16-lane subgroups and fp16 arithmetic,
+   * which ggml-vulkan's Mali kernels are written for. Other GPUs (Bifrost Mali,
+   * Adreno, Xclipse, PowerVR) have not been measured with it and stay on the CPU.
+   */
+  static boolean isVulkanGpuSupported(String renderer) {
+    if (renderer == null) {
+      return false;
+    }
+    if (renderer.startsWith("Immortalis-") || renderer.startsWith("Mali-G1-")) {
+      return true;
+    }
+    Matcher mali = MALI_PATTERN.matcher(renderer);
+    if (!mali.find()) {
+      return false;
+    }
+    int model = Integer.parseInt(mali.group(1));
+    return model == 57 || model == 68 || model == 77 || model == 78 || model >= 300;
+  }
+
+  // Vulkan has no Java binding; the GL renderer string names the same GPU. A
+  // throwaway 1x1 pbuffer context is enough to read it.
+  private static String glRenderer() {
+    EGLDisplay display = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY);
+    if (display == EGL14.EGL_NO_DISPLAY || !EGL14.eglInitialize(display, null, 0, null, 0)) {
+      return null;
+    }
+    EGLContext eglContext = EGL14.EGL_NO_CONTEXT;
+    EGLSurface surface = EGL14.EGL_NO_SURFACE;
+    try {
+      int[] configAttributes = {
+        EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+        EGL14.EGL_SURFACE_TYPE, EGL14.EGL_PBUFFER_BIT,
+        EGL14.EGL_NONE
+      };
+      EGLConfig[] configs = new EGLConfig[1];
+      int[] count = new int[1];
+      if (!EGL14.eglChooseConfig(display, configAttributes, 0, configs, 0, 1, count, 0) || count[0] == 0) {
+        return null;
+      }
+      int[] contextAttributes = { EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE };
+      eglContext = EGL14.eglCreateContext(display, configs[0], EGL14.EGL_NO_CONTEXT, contextAttributes, 0);
+      int[] surfaceAttributes = { EGL14.EGL_WIDTH, 1, EGL14.EGL_HEIGHT, 1, EGL14.EGL_NONE };
+      surface = EGL14.eglCreatePbufferSurface(display, configs[0], surfaceAttributes, 0);
+      if (eglContext == EGL14.EGL_NO_CONTEXT || surface == EGL14.EGL_NO_SURFACE
+          || !EGL14.eglMakeCurrent(display, surface, surface, eglContext)) {
+        return null;
+      }
+      return GLES20.glGetString(GLES20.GL_RENDERER);
+    } finally {
+      EGL14.eglMakeCurrent(display, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT);
+      if (surface != EGL14.EGL_NO_SURFACE) {
+        EGL14.eglDestroySurface(display, surface);
+      }
+      if (eglContext != EGL14.EGL_NO_CONTEXT) {
+        EGL14.eglDestroyContext(display, eglContext);
+      }
+      EGL14.eglTerminate(display);
+    }
+  }
+
   public static synchronized boolean loadNative(ReactApplicationContext context) {
     if (libsLoaded) {
       return true;
@@ -69,11 +201,18 @@ public class RNWhisper {
 
     String cpuFeatures = getCpuFeatures();
     boolean hasFp16 = cpuFeatures.contains("fp16") || cpuFeatures.contains("fphp");
+    String accelerator = acceleration(context);
 
     try {
       if (isArm64V8a()) {
-        if (hasFp16 && isHexagonSupported() && prepareHexagon(context)
+        if (accelerator.equals(ACCELERATION_HEXAGON) && prepareHexagon(context)
             && tryLoadLibrary("rnwhisper_jni_v8fp16_va_2_hexagon")) {
+          libsLoaded = true;
+          return true;
+        }
+
+        if (accelerator.equals(ACCELERATION_VULKAN)
+            && tryLoadLibrary("rnwhisper_jni_v8fp16_va_2_vulkan")) {
           libsLoaded = true;
           return true;
         }
