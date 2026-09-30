@@ -78,6 +78,27 @@ const std::vector<std::string> type_names = {
     "bf16",
 };
 
+// --types f32,f16,q5_0 and --no-flash-attn leave the other types' shaders and
+// flash attention out of the build (an app that runs one model family needs a
+// fraction of the ~1500 shaders). Their symbols stay defined with zero length;
+// ggml-vulkan is built with the matching GGML_VK_SHADER_TYPES and
+// GGML_VK_NO_FLASH_ATTN and reports those ops as unsupported.
+std::set<std::string> excluded_types;
+bool exclude_flash_attn = false;
+
+static bool shader_excluded(const std::string & name) {
+    if (exclude_flash_attn && name.rfind("flash_attn", 0) == 0) {
+        return true;
+    }
+    for (const std::string & t : excluded_types) {
+        if (name == t || name.rfind(t + "_", 0) == 0 || name.find("_" + t + "_") != std::string::npos ||
+            (name.size() > t.size() && name.compare(name.size() - t.size() - 1, t.size() + 1, "_" + t) == 0)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 enum MatMulIdType {
     NONE,
     DEFAULT,
@@ -450,6 +471,11 @@ void string_to_spv(std::string name, const std::string& source, const std::map<s
         return;
     } else if (basename(input_filepath) != source) {
         // Only compile shader variants matching the input filename
+        return;
+    }
+    if (shader_excluded(name)) {
+        // defined with zero length in write_output_files
+        shader_fnames.push_back(std::pair(name, std::string()));
         return;
     }
 
@@ -1264,6 +1290,11 @@ void write_output_files() {
         hdr << "extern const uint64_t " << name << "_len;\n";
         hdr << "extern const unsigned char " << name << "_data[];\n\n";
 
+        if (input_filepath != "" && path.empty()) {
+            src << "const uint64_t " << name << "_len = 0;\n";
+            src << "const unsigned char " << name << "_data[1] = {0};\n\n";
+            continue;
+        }
         if (input_filepath != "") {
             std::string data = read_binary_file(path);
             if (data.empty()) {
@@ -1421,6 +1452,25 @@ int main(int argc, char** argv) {
     }
     if (args.find("--target-cpp") != args.end()) {
         target_cpp = args["--target-cpp"]; // Path to generated cpp file
+    }
+    if (args.find("--types") != args.end()) {
+        std::set<std::string> keep;
+        std::stringstream list(args["--types"]);
+        for (std::string t; std::getline(list, t, ',');) {
+            keep.insert(t);
+        }
+        for (const std::string & t : type_names) {
+            if (!keep.count(t)) {
+                excluded_types.insert(t);
+            }
+        }
+        // q8_1 only serves integer-dot matmuls (activations quantized on the fly)
+        if (!keep.count("q8_1")) {
+            excluded_types.insert("q8_1");
+        }
+    }
+    if (args.find("--no-flash-attn") != args.end()) {
+        exclude_flash_attn = true;
     }
 
     if (!directory_exists(output_dir)) {

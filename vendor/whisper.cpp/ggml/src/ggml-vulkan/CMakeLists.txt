@@ -202,6 +202,19 @@ if (Vulkan_FOUND)
     set (_ggml_vk_output_dir "${CMAKE_CURRENT_BINARY_DIR}/vulkan-shaders.spv")
     set (_ggml_vk_generated_shader_files ${_ggml_vk_header})
 
+    # A reduced shader set: GGML_VULKAN_SHADER_TYPES (e.g. "f32,f16,q5_0") and
+    # GGML_VULKAN_NO_FLASH_ATTN leave the other shaders out; those ops then run
+    # on another backend.
+    set(_ggml_vk_gen_filter)
+    if (GGML_VULKAN_SHADER_TYPES)
+        list(APPEND _ggml_vk_gen_filter --types ${GGML_VULKAN_SHADER_TYPES})
+        target_compile_definitions(ggml-vulkan PRIVATE GGML_VK_SHADER_TYPES="${GGML_VULKAN_SHADER_TYPES}")
+    endif()
+    if (GGML_VULKAN_NO_FLASH_ATTN)
+        list(APPEND _ggml_vk_gen_filter --no-flash-attn)
+        target_compile_definitions(ggml-vulkan PRIVATE GGML_VK_NO_FLASH_ATTN)
+    endif()
+
     file(GLOB _ggml_vk_shader_files CONFIGURE_DEPENDS "${_ggml_vk_input_dir}/*.comp")
     set_source_files_properties(${_ggml_vk_shader_files} PROPERTIES HEADER_FILE_ONLY TRUE)
     target_sources(ggml-vulkan PRIVATE ${_ggml_vk_shader_files})
@@ -238,6 +251,7 @@ if (Vulkan_FOUND)
                 --output-dir ${_ggml_vk_output_dir}
                 --target-hpp ${_ggml_vk_header}
                 --target-cpp ${_ggml_vk_target_cpp}
+                ${_ggml_vk_gen_filter}
             DEPENDS ${file_full}
                     ${_ggml_vk_shaders_gen_sources}
                     vulkan-shaders-gen

@@ -4698,6 +4698,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             if (pipeline->compiled) {
                 continue;
             }
+            if (spv_size == 0) {
+                // left out by vulkan-shaders-gen --types / --no-flash-attn;
+                // ggml_vk_shader_types_ok keeps ops that need it off this backend
+                GGML_ABORT("ggml_vulkan: shader %s is not built into this binary", name);
+            }
 
             wait_pipeline = pipeline;
 
@@ -6999,6 +7004,12 @@ static vk_device ggml_vk_get_device(size_t idx) {
         }
 
         device->integer_dot_product = device->integer_dot_product && shader_integer_dot_product_props.integerDotProduct4x8BitPackedSignedAccelerated;
+#ifdef GGML_VK_SHADER_TYPES
+        // integer-dot matmuls quantize the activations to q8_1 on the fly
+        if ((std::string(",") + GGML_VK_SHADER_TYPES + ",").find(",q8_1,") == std::string::npos) {
+            device->integer_dot_product = false;
+        }
+#endif
 
         device->min_imported_host_pointer_alignment = external_memory_host_props.minImportedHostPointerAlignment;
 
@@ -19802,7 +19813,46 @@ static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const 
     return ggml_backend_vk_init(ctx->device);
 }
 
+// Builds with a reduced shader set (vulkan-shaders-gen --types, --no-flash-attn)
+// define GGML_VK_SHADER_TYPES (e.g. "f32,f16,q5_0") and GGML_VK_NO_FLASH_ATTN;
+// ops on other tensor types, and flash attention, then run on another backend.
+static bool ggml_vk_shader_types_ok(const ggml_tensor * op) {
+#ifdef GGML_VK_NO_FLASH_ATTN
+    if (op->op == GGML_OP_FLASH_ATTN_EXT) {
+        return false;
+    }
+#endif
+#ifdef GGML_VK_SHADER_TYPES
+    static const std::set<std::string> types = [] {
+        std::set<std::string> result;
+        std::stringstream list(GGML_VK_SHADER_TYPES);
+        for (std::string t; std::getline(list, t, ',');) {
+            result.insert(t);
+        }
+        return result;
+    }();
+    auto ok = [&](const ggml_tensor * t) {
+        // index and integer tensors have no per-type shader variants
+        return t == nullptr || t->type == GGML_TYPE_I32 || t->type == GGML_TYPE_I64 || t->type == GGML_TYPE_I16 ||
+               t->type == GGML_TYPE_I8 || types.count(ggml_type_name(t->type)) > 0;
+    };
+    if (!ok(op)) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (!ok(op->src[i])) {
+            return false;
+        }
+    }
+#endif
+    GGML_UNUSED(op);
+    return true;
+}
+
 static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    if (!ggml_vk_shader_types_ok(op)) {
+        return false;
+    }
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
     const vk_device& device = ggml_vk_get_device(ctx->device);
 
