@@ -24,6 +24,12 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type(voi
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_vk_reg(void);
 
+// Keeps compiled pipelines in a VkPipelineCache stored at `path` (per device:
+// `path` for device 0, `path.<n>` otherwise), so they are not compiled again
+// in the next process. Call before the first device is initialized; the file
+// is rewritten after a graph that compiled new pipelines.
+GGML_BACKEND_API void ggml_backend_vk_set_pipeline_cache_path(const char * path);
+
 #ifdef  __cplusplus
 }
 #endif
