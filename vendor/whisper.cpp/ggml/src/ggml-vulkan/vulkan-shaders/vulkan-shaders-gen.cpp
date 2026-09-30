@@ -6,6 +6,7 @@
 #include <array>
 #include <vector>
 #include <map>
+#include <set>
 #include <thread>
 #include <mutex>
 #include <future>
@@ -853,6 +854,11 @@ void process_shaders() {
     string_to_spv("norm_f32", "norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("group_norm_f32", "group_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("rms_norm_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
+    string_to_spv("copy_rows_f32_f16", "copy_rows_f16.comp", {{"A_TYPE", "float"}});
+    string_to_spv("copy_rows_f16_f16", "copy_rows_f16.comp", {{"A_TYPE", "float16_t"}});
+    string_to_spv("soft_max_mali_f32", "soft_max_mali.comp", {{"D_TYPE", "float"}});
+    string_to_spv("soft_max_mali_f16", "soft_max_mali.comp", {{"D_TYPE", "float16_t"}});
+    string_to_spv("norm_mul_add_f32", "norm_mul_add.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("rms_norm_mul_add_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"RMS_NORM_ADD_FUSION", "1"}}));
     string_to_spv("rms_norm_mul_add_partials_f32", "rms_norm_partials.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"RMS_NORM_ADD_FUSION", "1"}}));
     string_to_spv("rms_norm_set_rows_f32_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"RMS_NORM_SET_ROWS_FUSION", "1"}}));
@@ -1085,6 +1091,12 @@ void process_shaders() {
     string_to_spv("rope_vision_f16", "rope_vision.comp", {{"A_TYPE", "float16_t"}, {"ROPE_D_TYPE", "float16_t"}});
 
     string_to_spv("argsort_f32", "argsort.comp", {{"A_TYPE", "float"}});
+    string_to_spv("matmul_mali_f16", "mul_mm_mali.comp", {});
+    string_to_spv("matmul_mali_f16_epilogue", "mul_mm_mali.comp", {{"EPILOGUE", "1"}});
+    string_to_spv("mul_mat_vec_mali_f16_f32", "mul_mat_vec_mali.comp", {});
+    string_to_spv("mul_mat_vec_q5_planar_f32", "mul_mat_vec_q5_planar.comp", {});
+    string_to_spv("dequant_q5_planar", "dequant_q5_planar.comp", {});
+    string_to_spv("get_rows_q5_planar", "get_rows_q5_planar.comp", {});
     string_to_spv("argsort_large_f32", "argsort_large.comp", {{"A_TYPE", "float"}});
 
     string_to_spv("topk_argsort_f32", "topk_argsort.comp", {{"A_TYPE", "float"}});

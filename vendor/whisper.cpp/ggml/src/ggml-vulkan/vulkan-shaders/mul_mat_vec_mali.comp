@@ -1,0 +1,108 @@
+#version 450
+
+// f16 x f32 matrix-vector product for Arm Mali (Valhall), in mul_mat_vec's
+// interface, for one output column: d[m] = sum_k A[m][k] * x[k] (+ fused biases).
+//
+// Each 16-lane subgroup owns ROWS_PER_SG rows. Lanes sweep K together with
+// 128-bit loads of A (256 contiguous bytes per row per step); each x chunk
+// (two 128-bit f32 loads) is reused across the subgroup's rows, which keeps
+// the load/store unit from limiting a memory-bound kernel. Accumulation is in
+// f32, reduced with subgroupAdd; no shared memory and no specialization-
+// constant loops, so nothing spills to the stack.
+//
+// Requires K, the row stride and the batch strides to be multiples of 8, and
+// 16-byte aligned A and x offsets.
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#define LANES 16
+#define SUBGROUPS 4
+#define ROWS_PER_SG 4
+#define ROWS_PER_WG (SUBGROUPS * ROWS_PER_SG)
+
+#define MAT_VEC_FUSION_FLAGS_BIAS0 0x1
+#define MAT_VEC_FUSION_FLAGS_BIAS1 0x2
+
+layout(local_size_x = LANES * SUBGROUPS, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A { uvec4 data_a[]; };
+layout (binding = 1) readonly buffer B { vec4 data_b[]; };
+layout (binding = 2) writeonly buffer D { float data_d[]; };
+layout (binding = 3) readonly buffer Fuse0 { float data_fuse0[]; };
+layout (binding = 4) readonly buffer Fuse1 { float data_fuse1[]; };
+
+layout (push_constant) uniform parameter
+{
+    uint ncols;
+    uint stride_a;
+    uint stride_b;
+    uint stride_d;
+    uint batch_stride_a;
+    uint batch_stride_b;
+    uint batch_stride_d;
+    uint fusion_flags;
+    uint base_work_group_y;
+    uint ne02;
+    uint ne12;
+    uint broadcast2;
+    uint broadcast3;
+} p;
+
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+    // Rows beyond maxComputeWorkGroupCount[0] are spread over z (see the host).
+    const uint row_block = gl_WorkGroupID.z * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    const uint row0 = row_block * ROWS_PER_WG + gl_SubgroupID * ROWS_PER_SG;
+    if (row0 >= p.stride_d) {
+        return;
+    }
+
+    const uint batch_idx = gl_WorkGroupID.y + p.base_work_group_y;
+    uint batch_idx_a = 0;
+    if (batch_idx != 0) {
+        const uint i13 = batch_idx / p.ne12;
+        const uint i12 = batch_idx % p.ne12;
+        const uint i03 = i13 / p.broadcast3;
+        const uint i02 = i12 / p.broadcast2;
+        batch_idx_a = i03 * p.ne02 + i02;
+    }
+
+    uint a_base[ROWS_PER_SG];
+    [[unroll]] for (uint r = 0; r < ROWS_PER_SG; r++) {
+        // Rows past the end repeat the last one; their results are not stored.
+        a_base[r] = (batch_idx_a * p.batch_stride_a + min(row0 + r, p.stride_d - 1) * p.stride_a) / 8;
+    }
+    const uint b_base = (batch_idx * p.batch_stride_b) / 4;
+    const uint d_offset = batch_idx * p.batch_stride_d;
+
+    float acc[ROWS_PER_SG];
+    [[unroll]] for (uint r = 0; r < ROWS_PER_SG; r++) {
+        acc[r] = 0.0;
+    }
+    for (uint k = lane; k < p.ncols / 8; k += LANES) {
+        const vec4 x0 = data_b[b_base + 2 * k];
+        const vec4 x1 = data_b[b_base + 2 * k + 1];
+        [[unroll]] for (uint r = 0; r < ROWS_PER_SG; r++) {
+            const uvec4 a = data_a[a_base[r] + k];
+            acc[r] += dot(vec4(unpackHalf2x16(a.x), unpackHalf2x16(a.y)), x0) +
+                      dot(vec4(unpackHalf2x16(a.z), unpackHalf2x16(a.w)), x1);
+        }
+    }
+
+    [[unroll]] for (uint r = 0; r < ROWS_PER_SG; r++) {
+        float sum = subgroupAdd(acc[r]);
+        const uint row = row0 + r;
+        if (lane == 0 && row < p.stride_d) {
+            if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
+                sum += data_fuse0[d_offset + row];
+            }
+            if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
+                sum += data_fuse1[d_offset + row];
+            }
+            data_d[d_offset + row] = sum;
+        }
+    }
+}

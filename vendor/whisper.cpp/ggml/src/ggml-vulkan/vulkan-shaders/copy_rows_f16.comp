@@ -1,0 +1,46 @@
+#version 450
+
+// Copies a tensor with contiguous rows (any row/batch strides, e.g. permuted
+// views) into dense f16 rows with a caller-chosen row stride, for the Mali
+// matmul's operands. One invocation per 8 elements of a row: 8 loads, one
+// 128-bit store; ggml's generic cpy does one element per invocation with a
+// 4-D index decomposition each. Elements past ne0 in the last block are
+// written as zero; the rest of a padded row is left untouched.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter
+{
+    uint ne0, ne1, ne2;
+    uint nb1, nb2, nb3;  // source strides in elements
+    uint src_offset;     // in elements
+    uint dst_stride;     // destination row stride in halves, a multiple of 8
+    uint nrows;
+} p;
+
+layout (binding = 0) readonly buffer A { A_TYPE data_a[]; };
+layout (binding = 1) writeonly buffer D { uvec4 data_d[]; };
+
+void main() {
+    const uint chunk = gl_GlobalInvocationID.x;
+    const uint row = gl_WorkGroupID.z * gl_NumWorkGroups.y + gl_WorkGroupID.y;
+    const uint col = chunk * 8;
+    if (col >= p.ne0 || row >= p.nrows) {
+        return;
+    }
+    const uint i1 = row % p.ne1;
+    const uint i2 = (row / p.ne1) % p.ne2;
+    const uint i3 = row / (p.ne1 * p.ne2);
+    const uint src = p.src_offset + i1 * p.nb1 + i2 * p.nb2 + i3 * p.nb3 + col;
+
+    float v[8];
+    [[unroll]] for (uint j = 0; j < 8; j++) {
+        v[j] = col + j < p.ne0 ? float(data_a[src + j]) : 0.0;
+    }
+    data_d[(row * p.dst_stride + col) / 8] = uvec4(packHalf2x16(vec2(v[0], v[1])), packHalf2x16(vec2(v[2], v[3])),
+                                                   packHalf2x16(vec2(v[4], v[5])), packHalf2x16(vec2(v[6], v[7])));
+}

@@ -1,0 +1,181 @@
+#version 450
+
+// f16 x f16 matmul for Arm Mali (Valhall), in mul_mm's interface:
+// D[n][m] = sum_k A[m][k] * B[n][k] with batch broadcasting.
+//
+// Mali has no dedicated shared memory; workgroup memory goes through the same
+// load/store unit as buffers, and mul_mm's staging through it, with 32-bit
+// reads, leaves the shader load/store bound. Here each thread keeps a 1 x N0
+// output block in registers and reads rows straight from the buffers with
+// 128-bit loads; neighbouring lanes take neighbouring A rows and share their
+// B rows, so the L1 cache provides the reuse. Loops use compile-time bounds so
+// the accumulators stay in registers. That reuse needs the workgroup's warps to
+// read the same rows at about the same time; over a long K loop they drift
+// apart and the lines are evicted first (K = 3072 ran at 60% of the K = 768
+// rate), so the workgroup meets at a barrier every SYNC_BLOCKS iterations.
+//
+// Requires the row strides and batch strides to be multiples of 8 halves and
+// 16-byte aligned buffer offsets. K only needs to be even: when it is not a
+// multiple of 8 the caller pads the row stride, and the last 128-bit block is
+// loaded whole but only its first K % 8 halves are used.
+//
+// Split-k (mul_mm's contract): x covers blocks_m * split_k workgroups; slice
+// ik sums k in [ik * k_split, (ik + 1) * k_split) and writes its partial
+// result at ik * batch_stride_d * num_batches, for the split_k reduce shader.
+// k_split is a multiple of 256, so only the last slice can have a K tail.
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+
+#define WG_M 32
+#define WG_N 8
+#define N0 16
+#define SYNC_BLOCKS 16
+
+layout(local_size_x = WG_M, local_size_y = WG_N, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A { uvec4 data_a[]; };
+layout (binding = 1) readonly buffer B { uvec4 data_b[]; };
+layout (binding = 2) writeonly buffer D { float data_d[]; };
+#ifdef EPILOGUE
+// Fused into the store: + bias[m] (flag 1), + a residual shaped like D
+// (flag 2), then GELU (flag 4), for MUL_MAT -> ADD -> ADD / GELU.
+layout (binding = 3) readonly buffer Bias { float data_bias[]; };
+layout (binding = 4) readonly buffer Resid { float data_resid[]; };
+#define EPILOGUE_BIAS 1
+#define EPILOGUE_RESID 2
+#define EPILOGUE_GELU 4
+#endif
+
+layout (push_constant) uniform parameter
+{
+    uint M;
+    uint N;
+    uint K;
+    uint stride_a;
+    uint stride_b;
+    uint stride_d;
+
+    uint batch_stride_a;
+    uint batch_stride_b;
+    uint batch_stride_d;
+
+    uint base_work_group_z;
+    uint num_batches;
+    uint k_split;
+    uint ne02;
+    uint ne12;
+    uint broadcast2;
+    uint broadcast3;
+    uint padded_N;
+#ifdef EPILOGUE
+    uint epilogue;
+#endif
+} p;
+
+#ifdef EPILOGUE
+// as unary.comp's op_gelu
+float gelu(float x) {
+    const float GELU_COEF_A    = 0.044715f;
+    const float SQRT_2_OVER_PI = 0.79788456080286535587989211986876f;
+    const float val = SQRT_2_OVER_PI*x*(1.0f + GELU_COEF_A*x*x);
+    return 0.5f*x*(2.0f - 2.0f / (exp(2.0f * val) + 1.0f));
+}
+#endif
+
+void main() {
+    const uint batch_idx = gl_WorkGroupID.z + p.base_work_group_z;
+    const uint i13 = batch_idx / p.ne12;
+    const uint i12 = batch_idx % p.ne12;
+    const uint i03 = i13 / p.broadcast3;
+    const uint i02 = i12 / p.broadcast2;
+    const uint batch_idx_a = i03 * p.ne02 + i02;
+
+    const uint blocks_m = (p.M + WG_M - 1) / WG_M;
+    const uint ik = gl_WorkGroupID.x / blocks_m;
+    const uint m = (gl_WorkGroupID.x % blocks_m) * WG_M + gl_LocalInvocationID.x;
+    const uint n0 = (gl_WorkGroupID.y * WG_N + gl_LocalInvocationID.y) * N0;
+    // Products narrower than one workgroup (the decoder's few-token batches)
+    // are short and mostly out of range: those invocations return at once and
+    // nothing syncs. Otherwise every invocation stays for the barriers, and
+    // those past M or N skip the loads and store nothing.
+    const bool sync = p.N >= WG_N * N0;
+    const bool in_range = m < p.M && n0 < p.N;
+    if (!sync && !in_range) {
+        return;
+    }
+
+    // Two k-partials per output: packed f16x2, one register each.
+    f16vec2 acc[N0];
+    [[unroll]] for (uint j = 0; j < N0; j++) {
+        acc[j] = f16vec2(0.0hf);
+    }
+
+    const uint ia = (batch_idx_a * p.batch_stride_a + min(m, p.M - 1) * p.stride_a) / 8;
+    uint ib[N0];
+    [[unroll]] for (uint j = 0; j < N0; j++) {
+        // Rows past N repeat the last one; their results are not stored.
+        ib[j] = (batch_idx * p.batch_stride_b + min(n0 + j, p.N - 1) * p.stride_b) / 8;
+    }
+
+    const uint k_end = min(p.K, (ik + 1) * p.k_split);
+    const uint k_blocks = k_end / 8;
+    const uint k_begin = ik * p.k_split / 8;
+    for (uint k = k_begin; k < k_blocks; k++) {
+        if (sync && (k - k_begin) % SYNC_BLOCKS == 0 && k != k_begin) {
+            barrier();
+        }
+        if (!in_range) {
+            continue;
+        }
+        const uvec4 a = data_a[ia + k];
+        uvec4 b[N0];
+        [[unroll]] for (uint j = 0; j < N0; j++) {
+            b[j] = data_b[ib[j] + k];
+        }
+        [[unroll]] for (uint j = 0; j < N0; j++) {
+            [[unroll]] for (uint q = 0; q < 4; q++) {
+                acc[j] = fma(unpackFloat2x16(a[q]), unpackFloat2x16(b[j][q]), acc[j]);
+            }
+        }
+    }
+
+    if (!in_range) {
+        return;
+    }
+
+    // Partial last block: halves past K are padding and are never used.
+    const uint k_tail = (k_end % 8) / 2;
+    if (k_tail != 0) {
+        const uvec4 a = data_a[ia + k_blocks];
+        [[unroll]] for (uint j = 0; j < N0; j++) {
+            const uvec4 b = data_b[ib[j] + k_blocks];
+            [[unroll]] for (uint q = 0; q < 3; q++) {
+                if (q < k_tail) {
+                    acc[j] = fma(unpackFloat2x16(a[q]), unpackFloat2x16(b[q]), acc[j]);
+                }
+            }
+        }
+    }
+
+    const uint d_base = batch_idx * p.batch_stride_d + ik * p.batch_stride_d * p.num_batches;
+    [[unroll]] for (uint j = 0; j < N0; j++) {
+        if (n0 + j < p.N) {
+            const uint d = d_base + (n0 + j) * p.stride_d + m;
+            float v = float(acc[j].x) + float(acc[j].y);
+#ifdef EPILOGUE
+            if ((p.epilogue & EPILOGUE_BIAS) != 0) {
+                v += data_bias[m];
+            }
+            if ((p.epilogue & EPILOGUE_RESID) != 0) {
+                v += data_resid[d];
+            }
+            if ((p.epilogue & EPILOGUE_GELU) != 0) {
+                v = gelu(v);
+            }
+#endif
+            data_d[d] = v;
+        }
+    }
+}

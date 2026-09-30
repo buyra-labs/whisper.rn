@@ -1,0 +1,62 @@
+#version 450
+
+// Planar q5_0 (qs[N] | qh[N] | d[N], see mul_mat_vec_q5_planar.comp) to f16,
+// in the dequant shaders' interface. One invocation per 32-weight block;
+// the output is written as four 128-bit stores.
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer AQs { uvec4 a_qs[]; };
+layout (binding = 0) readonly buffer AQh { uint a_qh[]; };
+layout (binding = 0) readonly buffer AD { float16_t a_d[]; };
+layout (binding = 1) writeonly buffer D { uvec4 data_d[]; };
+
+layout (push_constant) uniform parameter
+{
+    uint M;
+    uint K;
+    uint stride_a;
+    uint stride_b;
+    uint nel;
+} p;
+
+// Two weights (bytes 0 and 2, or 1 and 3, of q) as (q - 16) * d, packed f16x2.
+uint pair(uint q, float d) {
+    const vec2 v = vec2(unpackFloat2x16((q & 0x00FF00FFu) | 0x64006400u) - f16vec2(1040.0hf));
+    return packHalf2x16(v * d);
+}
+
+void main() {
+    const uint n_blocks = p.nel / 32;
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= n_blocks) {
+        return;
+    }
+
+    const uvec4 qs = a_qs[i];
+    const uint qh = a_qh[4 * n_blocks + i];
+    const float d = float(a_d[10 * n_blocks + i]);
+
+    // Elements 0..15 are the low nibbles, 16..31 the high nibbles.
+    [[unroll]] for (uint h = 0; h < 2; h++) {
+        uint words[4];
+        [[unroll]] for (uint u = 0; u < 4; u++) {
+            const uint nib = (qs[u] >> (4 * h)) & 0x0F0F0F0Fu;
+            const uint hb = (qh >> (16 * h + 4 * u)) & 0xFu;
+            words[u] = nib | (((hb * 0x00204081u) & 0x01010101u) << 4);
+        }
+        // Each word holds 4 consecutive weights; interleave the byte pairs
+        // back into element order.
+        [[unroll]] for (uint u = 0; u < 4; u += 2) {
+            const uint e0 = pair(words[u], d), o0 = pair(words[u] >> 8, d);
+            const uint e1 = pair(words[u + 1], d), o1 = pair(words[u + 1] >> 8, d);
+            data_d[i * 4 + h * 2 + u / 2] = uvec4(
+                (e0 & 0xFFFFu) | (o0 << 16), (e0 >> 16) | (o0 & 0xFFFF0000u),
+                (e1 & 0xFFFFu) | (o1 << 16), (e1 >> 16) | (o1 & 0xFFFF0000u));
+        }
+    }
+}

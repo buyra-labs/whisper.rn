@@ -1,0 +1,48 @@
+#version 450
+
+// GET_ROWS from a planar q5_0 matrix (qs[N] | qh[N] | d[N], see
+// mul_mat_vec_q5_planar.comp) into f32 rows: dst[r][:] = A[idx[r]][:].
+// One invocation per (output row, block).
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer AQs { uvec4 a_qs[]; };
+layout (binding = 0) readonly buffer AQh { uint a_qh[]; };
+layout (binding = 0) readonly buffer AD { float16_t a_d[]; };
+layout (binding = 1) readonly buffer I { int data_i[]; };
+layout (binding = 2) writeonly buffer D { float data_d[]; };
+
+layout (push_constant) uniform parameter
+{
+    uint ncols;      // K, a multiple of 32
+    uint n_blocks;   // blocks in the whole matrix
+    uint n_rows;     // output rows
+    uint dst_stride; // f32 elements between output rows
+} p;
+
+void main() {
+    const uint nb = p.ncols / 32;
+    const uint b = gl_GlobalInvocationID.x;
+    const uint r = gl_GlobalInvocationID.y;
+    if (b >= nb || r >= p.n_rows) {
+        return;
+    }
+
+    const uint i = uint(data_i[r]) * nb + b;
+    const uvec4 qs = a_qs[i];
+    const uint qh = a_qh[4 * p.n_blocks + i];
+    const float d = float(a_d[10 * p.n_blocks + i]);
+    const uint out_base = r * p.dst_stride + b * 32;
+
+    [[unroll]] for (uint j = 0; j < 16; j++) {
+        const uint byte_ = (qs[j / 4] >> (8 * (j % 4))) & 0xFFu;
+        const int q0 = int((byte_ & 0xFu) | (((qh >> j) & 1u) << 4));
+        const int q1 = int((byte_ >> 4) | (((qh >> (j + 16)) & 1u) << 4));
+        data_d[out_base + j] = float(q0 - 16) * d;
+        data_d[out_base + j + 16] = float(q1 - 16) * d;
+    }
+}

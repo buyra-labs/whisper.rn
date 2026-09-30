@@ -1,0 +1,140 @@
+#version 450
+
+// q5_0 x f32 matrix-vector product on the planar q5_0 layout, in
+// mul_mat_vec's interface, for one output column: d[m] = sum_k A[m][k] * x[k]
+// (+ fused biases).
+//
+// Planar q5_0 (see ggml_vk_q5_planar_repack): a 2-D tensor of N blocks is
+// stored as qs[N] (16 bytes each) | qh[N] (uint32) | d[N] (f16), the same 22
+// bytes per block as q5_0, so every block's nibbles are one aligned 128-bit
+// load. N = batch_stride_a / 32.
+//
+// Invocations work in clusters of 16 (one Mali subgroup). A cluster owns
+// ROWS_PER_CLUSTER rows; its lanes split each row into half-blocks (16
+// weights: a block's low or high nibbles), load their 16 x values once and
+// apply them to all of the cluster's rows. Four weights are decoded per 32-bit
+// word: nibbles by mask, high bits spread by a multiply, and bytes turned into
+// f16 (1024 + q) by OR-ing 0x6400; subtracting 1040 in packed f16 gives q - 16
+// exactly. Accumulation is in f32, reduced with subgroupClusteredAdd.
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+
+#ifndef ROWS_PER_CLUSTER
+#define ROWS_PER_CLUSTER 4
+#endif
+#define CLUSTER 16
+#define CLUSTERS 4
+
+#define MAT_VEC_FUSION_FLAGS_BIAS0 0x1
+#define MAT_VEC_FUSION_FLAGS_BIAS1 0x2
+
+layout(local_size_x = CLUSTER * CLUSTERS, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer AQs { uvec4 a_qs[]; };
+layout (binding = 0) readonly buffer AQh { uint a_qh[]; };
+layout (binding = 0) readonly buffer AD { float16_t a_d[]; };
+layout (binding = 1) readonly buffer B { vec4 data_b[]; };
+layout (binding = 2) writeonly buffer D { float data_d[]; };
+layout (binding = 3) readonly buffer Fuse0 { float data_fuse0[]; };
+layout (binding = 4) readonly buffer Fuse1 { float data_fuse1[]; };
+
+layout (push_constant) uniform parameter
+{
+    uint ncols;
+    uint stride_a;
+    uint stride_b;
+    uint stride_d;
+    uint batch_stride_a;
+    uint batch_stride_b;
+    uint batch_stride_d;
+    uint fusion_flags;
+    uint base_work_group_y;
+    uint ne02;
+    uint ne12;
+    uint broadcast2;
+    uint broadcast3;
+} p;
+
+// Four consecutive weights of a half-block, as (q - 16), dotted with x[0..3].
+float dot4(uint nib4, uint hb4, vec4 x) {
+    const uint q = nib4 | (((hb4 * 0x00204081u) & 0x01010101u) << 4);
+    const vec2 lo = vec2(unpackFloat2x16((q & 0x00FF00FFu) | 0x64006400u) - f16vec2(1040.0hf));        // q0, q2
+    const vec2 hi = vec2(unpackFloat2x16(((q >> 8) & 0x00FF00FFu) | 0x64006400u) - f16vec2(1040.0hf)); // q1, q3
+    return lo.x * x.x + hi.x * x.y + lo.y * x.z + hi.y * x.w;
+}
+
+void main() {
+    // Clusters of 16 lanes within each subgroup (Mali: one per subgroup).
+    const uint lane = gl_SubgroupInvocationID % CLUSTER;
+    const uint cluster = gl_SubgroupID * (gl_SubgroupSize / CLUSTER) + gl_SubgroupInvocationID / CLUSTER;
+    // Rows beyond maxComputeWorkGroupCount[0] are spread over z (see the host).
+    const uint row_block = gl_WorkGroupID.z * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    const uint row0 = (row_block * CLUSTERS + cluster) * ROWS_PER_CLUSTER;
+    const uint rows = p.stride_d;
+    if (row0 >= rows) {
+        return;
+    }
+
+    // The weights are one 2-D tensor (batch_idx_a is always 0); the batch
+    // only selects x and the output.
+    const uint batch_idx = gl_WorkGroupID.y + p.base_work_group_y;
+    const uint b_base = (batch_idx * p.batch_stride_b) / 4;
+    const uint d_offset = batch_idx * p.batch_stride_d;
+
+    const uint nb = p.ncols / 32;
+    const uint n_blocks = p.batch_stride_a / 32;
+    const uint qh_base = 4 * n_blocks;  // in uints
+    const uint d_base = 10 * n_blocks;  // in halves
+
+    uint row_blocks[ROWS_PER_CLUSTER];
+    [[unroll]] for (uint r = 0; r < ROWS_PER_CLUSTER; r++) {
+        // Rows past the end repeat the last one; their results are not stored.
+        row_blocks[r] = min(row0 + r, rows - 1) * (p.stride_a / 32);
+    }
+
+    float acc[ROWS_PER_CLUSTER];
+    [[unroll]] for (uint r = 0; r < ROWS_PER_CLUSTER; r++) {
+        acc[r] = 0.0;
+    }
+
+    for (uint c = lane; c < 2 * nb; c += CLUSTER) {
+        const uint b = c >> 1;
+        const uint h = c & 1;
+        const uint xi = b_base + b * 8 + h * 4;
+        const vec4 x0 = data_b[xi + 0];
+        const vec4 x1 = data_b[xi + 1];
+        const vec4 x2 = data_b[xi + 2];
+        const vec4 x3 = data_b[xi + 3];
+
+        [[unroll]] for (uint r = 0; r < ROWS_PER_CLUSTER; r++) {
+            const uint i = row_blocks[r] + b;
+            const uvec4 qs = a_qs[i];
+            const uint qh = a_qh[qh_base + i] >> (16 * h);
+            const float d = float(a_d[d_base + i]);
+            const uint s = 4 * h;
+            const float t = dot4((qs.x >> s) & 0x0F0F0F0Fu, qh & 0xFu, x0) +
+                            dot4((qs.y >> s) & 0x0F0F0F0Fu, (qh >> 4) & 0xFu, x1) +
+                            dot4((qs.z >> s) & 0x0F0F0F0Fu, (qh >> 8) & 0xFu, x2) +
+                            dot4((qs.w >> s) & 0x0F0F0F0Fu, (qh >> 12) & 0xFu, x3);
+            acc[r] += d * t;
+        }
+    }
+
+    [[unroll]] for (uint r = 0; r < ROWS_PER_CLUSTER; r++) {
+        float sum = subgroupClusteredAdd(acc[r], CLUSTER);
+        const uint row = row0 + r;
+        if (lane == 0 && row < rows) {
+            if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
+                sum += data_fuse0[d_offset + row];
+            }
+            if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
+                sum += data_fuse1[d_offset + row];
+            }
+            data_d[d_offset + row] = sum;
+        }
+    }
+}

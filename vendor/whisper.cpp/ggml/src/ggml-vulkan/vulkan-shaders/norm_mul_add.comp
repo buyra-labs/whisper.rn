@@ -1,0 +1,66 @@
+#version 450
+
+// Fused layer norm: d = norm(a) * b + c, for NORM -> MUL -> ADD with the
+// weight b and bias c as vectors of ne00 broadcast over rows (whisper's
+// LayerNorm). One workgroup per row; subgroup reductions instead of norm.comp's
+// shared-memory tree, and two passes (mean, then squared deviations) over the
+// row, which stays in L1.
+
+#include "generic_binary_head.glsl"
+#include "types.glsl"
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout (binding = 3) readonly buffer C {float data_c[];};
+
+#define BLOCK_SIZE 256
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+shared float partial[BLOCK_SIZE];
+
+float workgroup_sum(float v) {
+    v = subgroupAdd(v);
+    if (gl_SubgroupInvocationID == 0) {
+        partial[gl_SubgroupID] = v;
+    }
+    barrier();
+    float s = 0.0;
+    for (uint i = 0; i < gl_NumSubgroups; i++) {
+        s += partial[i];
+    }
+    barrier();
+    return s;
+}
+
+void main() {
+    const uint ncols = p.ne00;
+    const uint row = gl_WorkGroupID.x;
+    const uint channel = gl_WorkGroupID.y;
+    const uint samp = gl_WorkGroupID.z;
+    const uint tid = gl_LocalInvocationID.x;
+
+    const uint a_offset = samp*p.nb03 + channel*p.nb02 + row*p.nb01 + get_aoffset();
+    const uint d_offset = ((samp*gl_NumWorkGroups.y + channel)*gl_NumWorkGroups.x + row)*ncols + get_doffset();
+    const uint b_offset = get_boffset();
+
+    float sum = 0.0;
+    for (uint col = tid; col < ncols; col += BLOCK_SIZE) {
+        sum += float(data_a[a_offset + col]);
+    }
+    const float mean = workgroup_sum(sum) / float(ncols);
+
+    float sq = 0.0;
+    for (uint col = tid; col < ncols; col += BLOCK_SIZE) {
+        const float x = float(data_a[a_offset + col]) - mean;
+        sq += x * x;
+    }
+    const float inv_std = inversesqrt(workgroup_sum(sq) / float(ncols) + p.param1);
+
+    for (uint col = tid; col < ncols; col += BLOCK_SIZE) {
+        const float x = (float(data_a[a_offset + col]) - mean) * inv_std;
+        data_d[d_offset + col] = D_TYPE(x * float(data_b[b_offset + col]) + data_c[col]);
+    }
+}

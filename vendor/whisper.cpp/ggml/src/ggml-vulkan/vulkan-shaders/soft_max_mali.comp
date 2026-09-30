@@ -1,0 +1,92 @@
+#version 450
+
+// Row softmax without mask, sinks or ALiBi: d = softmax(a * scale), for Arm
+// Mali. One workgroup per row of up to 128 * CACHE columns; the row is read
+// once into registers, reduced with subgroup operations (one barrier per
+// reduction instead of soft_max.comp's shared-memory tree) and written once,
+// as f16 when fused with the cast to f16 that the encoder's attention x V
+// needs (saving that pass and half the store).
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#define BLOCK_SIZE 128
+#define CACHE 16
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter
+{
+    uint ncols;
+    uint nrows;
+    float scale;
+} p;
+
+layout (binding = 0) readonly buffer A { float data_a[]; };
+layout (binding = 1) writeonly buffer D { D_TYPE data_d[]; };
+
+shared float reduce[BLOCK_SIZE];
+
+float workgroup_max(float v) {
+    v = subgroupMax(v);
+    if (gl_SubgroupInvocationID == 0) {
+        reduce[gl_SubgroupID] = v;
+    }
+    barrier();
+    float r = reduce[0];
+    for (uint i = 1; i < gl_NumSubgroups; i++) {
+        r = max(r, reduce[i]);
+    }
+    barrier();
+    return r;
+}
+
+float workgroup_sum(float v) {
+    v = subgroupAdd(v);
+    if (gl_SubgroupInvocationID == 0) {
+        reduce[gl_SubgroupID] = v;
+    }
+    barrier();
+    float r = 0.0;
+    for (uint i = 0; i < gl_NumSubgroups; i++) {
+        r += reduce[i];
+    }
+    barrier();
+    return r;
+}
+
+void main() {
+    const uint row = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    if (row >= p.nrows) {
+        return;
+    }
+    const uint tid = gl_LocalInvocationID.x;
+    const uint base = row * p.ncols;
+    const uint iters = (p.ncols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    float v[CACHE];
+    float mx = uintBitsToFloat(0xFF800000);
+    [[unroll]] for (uint i = 0; i < CACHE; i++) {
+        const uint col = i * BLOCK_SIZE + tid;
+        v[i] = i < iters && col < p.ncols ? data_a[base + col] * p.scale : uintBitsToFloat(0xFF800000);
+        mx = max(mx, v[i]);
+    }
+    mx = workgroup_max(mx);
+
+    float sum = 0.0;
+    [[unroll]] for (uint i = 0; i < CACHE; i++) {
+        v[i] = exp(v[i] - mx);
+        sum += v[i];
+    }
+    const float inv_sum = 1.0 / workgroup_sum(sum);
+
+    [[unroll]] for (uint i = 0; i < CACHE; i++) {
+        const uint col = i * BLOCK_SIZE + tid;
+        if (i < iters && col < p.ncols) {
+            data_d[base + col] = D_TYPE(v[i] * inv_sum);
+        }
+    }
+}

@@ -976,6 +976,19 @@ struct vk_device_struct {
     matmul_tile_selector_t matmul_id_tile_selector;
 
     vk_pipeline pipeline_matmul_split_k_reduce;
+    // Arm Mali: f16 x f16 matmul without shared memory (mul_mm_mali.comp) and
+    // f16 x f32 matrix-vector product (mul_mat_vec_mali.comp).
+    bool mali_mm;
+    vk_pipeline pipeline_matmul_mali;
+    vk_pipeline pipeline_matmul_mali_epilogue;
+    vk_pipeline pipeline_mul_mat_vec_mali;
+    // Planar q5_0 (see ggml_vk_q5_planar_repack): 2-D q5_0 weights are
+    // repacked at upload so memory-bound matrix-vector products stream them
+    // with 128-bit loads.
+    bool q5_planar;
+    vk_pipeline pipeline_mul_mat_vec_q5_planar;
+    vk_pipeline pipeline_dequant_q5_planar;
+    vk_pipeline pipeline_get_rows_q5_planar;
     vk_pipeline pipeline_quantize_q8_1_x4;
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
@@ -1039,6 +1052,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_rms_norm_f32;
     vk_pipeline pipeline_rms_norm_mul_f32;
     vk_pipeline pipeline_rms_norm_mul_add_f32;
+    vk_pipeline pipeline_norm_mul_add_f32;
+    vk_pipeline pipeline_soft_max_mali_f32, pipeline_soft_max_mali_f16;
+    vk_pipeline pipeline_copy_rows_f32_f16, pipeline_copy_rows_f16_f16;
     vk_pipeline pipeline_rms_norm_mul_add_mul_f32;
     vk_pipeline pipeline_rms_norm_mul_add_partials_f32;
     vk_pipeline pipeline_rms_norm_mul_add_mul_partials_f32;
@@ -2565,6 +2581,16 @@ struct ggml_backend_vk_context {
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
+    bool fused_norm_mul_add {};
+    bool fused_soft_max_f16 {};
+    // Mali matmul epilogue (ggml_vk_can_fuse_mali_mm_epilogue): flags, the
+    // bias and residual operands, and the last fused node (the output).
+    struct {
+        uint32_t flags;
+        const ggml_tensor * bias;
+        const ggml_tensor * resid;
+        ggml_tensor * out;
+    } mali_epilogue {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
@@ -5693,6 +5719,32 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q4_0], "dequant_q4_0", dequant_q4_0_len, dequant_q4_0_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q4_1], "dequant_q4_1", dequant_q4_1_len, dequant_q4_1_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q5_0], "dequant_q5_0", dequant_q5_0_len, dequant_q5_0_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
+    if (device->mali_mm) {
+        // wg_denoms: 32 rows of A x (8 lanes x 16 columns) of B per workgroup.
+        ggml_vk_create_pipeline(device, device->pipeline_matmul_mali, "matmul_mali_f16", matmul_mali_f16_len, matmul_mali_f16_data,
+                                "main", 3, sizeof(vk_mat_mat_push_constants), {32, 128, 1}, {}, 8);
+        ggml_vk_create_pipeline(device, device->pipeline_matmul_mali_epilogue, "matmul_mali_f16_epilogue", matmul_mali_f16_epilogue_len, matmul_mali_f16_epilogue_data,
+                                "main", 5, sizeof(vk_mat_mat_push_constants) + sizeof(uint32_t), {32, 128, 1}, {}, 8);
+        ggml_vk_create_pipeline(device, device->pipeline_copy_rows_f32_f16, "copy_rows_f32_f16", copy_rows_f32_f16_len, copy_rows_f32_f16_data,
+                                "main", 2, 9 * sizeof(uint32_t), {64 * 8, 1, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_copy_rows_f16_f16, "copy_rows_f16_f16", copy_rows_f16_f16_len, copy_rows_f16_f16_data,
+                                "main", 2, 9 * sizeof(uint32_t), {64 * 8, 1, 1}, {}, 1);
+        if (device->subgroup_size == 16) {
+            // Four rows per 16-lane subgroup, four subgroups per workgroup.
+            ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_mali, "mul_mat_vec_mali_f16_f32", mul_mat_vec_mali_f16_f32_len, mul_mat_vec_mali_f16_f32_data,
+                                    "main", 5, sizeof(vk_mat_vec_push_constants), {16, 1, 1}, {}, 1, false, true, 16);
+        }
+    }
+    if (device->q5_planar) {
+        // Four rows per 16-lane cluster, four clusters per workgroup.
+        ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_q5_planar, "mul_mat_vec_q5_planar_f32", mul_mat_vec_q5_planar_f32_len, mul_mat_vec_q5_planar_f32_data,
+                                "main", 5, sizeof(vk_mat_vec_push_constants), {16, 1, 1}, {}, 1, false, true);
+        // One 32-weight block per invocation.
+        ggml_vk_create_pipeline(device, device->pipeline_dequant_q5_planar, "dequant_q5_planar", dequant_q5_planar_len, dequant_q5_planar_data,
+                                "main", 2, 5 * sizeof(uint32_t), {64 * 32, 1, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_get_rows_q5_planar, "get_rows_q5_planar", get_rows_q5_planar_len, get_rows_q5_planar_data,
+                                "main", 3, 4 * sizeof(uint32_t), {64, 1, 1}, {}, 1);
+    }
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q5_1], "dequant_q5_1", dequant_q5_1_len, dequant_q5_1_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q8_0], "dequant_q8_0", dequant_q8_0_len, dequant_q8_0_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant_transpose[GGML_TYPE_Q8_0], "dequant_q8_0_transpose", dequant_q8_0_transpose_len, dequant_q8_0_transpose_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
@@ -5804,6 +5856,14 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_f32, "rms_norm_f32", rms_norm_f32_len, rms_norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_f32, "rms_norm_mul_f32", rms_norm_f32_len, rms_norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1}, 1, true);
+    if (device->subgroup_arithmetic &&
+        (device->vendor_id == VK_VENDOR_ID_ARM || getenv("GGML_VK_FORCE_MALI_SOFTMAX") != nullptr)) {
+        ggml_vk_create_pipeline(device, device->pipeline_soft_max_mali_f32, "soft_max_mali_f32", soft_max_mali_f32_len, soft_max_mali_f32_data, "main", 2, 3 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_soft_max_mali_f16, "soft_max_mali_f16", soft_max_mali_f16_len, soft_max_mali_f16_data, "main", 2, 3 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
+    }
+    if (device->subgroup_arithmetic) {
+        ggml_vk_create_pipeline(device, device->pipeline_norm_mul_add_f32, "norm_mul_add_f32", norm_mul_add_f32_len, norm_mul_add_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0}, 1, true);
+    }
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_add_f32, "rms_norm_mul_add_f32", rms_norm_mul_add_f32_len, rms_norm_mul_add_f32_data, "main", 5, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 0}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_add_mul_f32, "rms_norm_mul_add_mul_f32", rms_norm_mul_add_f32_len, rms_norm_mul_add_f32_data, "main", 5, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 1}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_add_partials_f32, "rms_norm_mul_add_partials_f32", rms_norm_mul_add_partials_f32_len, rms_norm_mul_add_partials_f32_data, "main", 6, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 0}, 1, true);
@@ -7166,6 +7226,17 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         device->fp16 = device->fp16 && vk12_features.shaderFloat16;
 
+        // Mali's workgroup memory shares the load/store unit with buffer
+        // access, which leaves mul_mm load/store bound there; f16 matmuls use
+        // mul_mm_mali.comp instead.
+        // GGML_VK_FORCE_MALI_MM enables the Mali f16 matmul on other GPUs, to test it.
+        device->mali_mm = (device->vendor_id == VK_VENDOR_ID_ARM || getenv("GGML_VK_FORCE_MALI_MM") != nullptr) &&
+                          device->fp16;
+
+        // GGML_VK_FORCE_Q5_PLANAR enables it on other GPUs, to test it.
+        device->q5_planar = (device->vendor_id == VK_VENDOR_ID_ARM || getenv("GGML_VK_FORCE_Q5_PLANAR") != nullptr) &&
+                            device->fp16;
+
 #if defined(VK_KHR_shader_bfloat16)
         device->bf16 = bfloat16_support && bfloat16_features.shaderBFloat16Type;
 #else
@@ -8435,6 +8506,41 @@ static void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffe
     }
 }
 
+// Planar q5_0: a 2-D q5_0 tensor of N blocks stored as qs[N] (16 bytes each)
+// | qh[N] (uint32) | d[N] (f16) instead of N interleaved 22-byte blocks. Same
+// size, so it is repacked in place at upload; tensor->extra marks it, and
+// only MUL_MAT (as src0), GET_ROWS (as src0) and reads understand it.
+static char vk_q5_planar_marker;
+
+static bool ggml_vk_is_q5_planar(const ggml_tensor * t) {
+    return t != nullptr && t->extra == &vk_q5_planar_marker;
+}
+
+static bool ggml_vk_uses_q5_planar(const ggml_tensor * t) {
+    return ggml_vk_is_q5_planar(t) || (t != nullptr && ggml_vk_is_q5_planar(t->view_src));
+}
+
+// ggml's block_q5_0: d (f16) at 0, qh (4 bytes) at 2, qs (16 bytes) at 6.
+static constexpr size_t Q5_0_BLOCK = 22, Q5_0_D = 0, Q5_0_QH = 2, Q5_0_QS = 6;
+
+static void ggml_vk_q5_planar_repack(const uint8_t * src, uint8_t * dst, size_t n_blocks) {
+    for (size_t i = 0; i < n_blocks; i++) {
+        const uint8_t * b = src + i * Q5_0_BLOCK;
+        memcpy(dst + 16 * i, b + Q5_0_QS, 16);
+        memcpy(dst + 16 * n_blocks + 4 * i, b + Q5_0_QH, 4);
+        memcpy(dst + 20 * n_blocks + 2 * i, b + Q5_0_D, 2);
+    }
+}
+
+static void ggml_vk_q5_planar_unpack(const uint8_t * src, uint8_t * dst, size_t n_blocks) {
+    for (size_t i = 0; i < n_blocks; i++) {
+        uint8_t * b = dst + i * Q5_0_BLOCK;
+        memcpy(b + Q5_0_QS, src + 16 * i, 16);
+        memcpy(b + Q5_0_QH, src + 16 * n_blocks + 4 * i, 4);
+        memcpy(b + Q5_0_D, src + 20 * n_blocks + 2 * i, 2);
+    }
+}
+
 static vk_subbuffer ggml_vk_tensor_subbuffer(
     const ggml_backend_vk_context * ctx, const ggml_tensor * tensor, bool allow_misalign = false) {
 
@@ -9191,6 +9297,19 @@ static void ggml_vk_buffer_memset(vk_buffer& dst, size_t offset, uint32_t c, siz
     ggml_vk_queue_command_pools_cleanup(dst->device);
 }
 
+// Mali matmul: the shader accumulates in packed f16, so long K is split into
+// slices of at most 768 whose partial sums are added in f32 by the split_k
+// reduce (the encoder's MLP down-projection, K = 3072, drifted by ~2e-2
+// unsplit).
+static uint32_t ggml_vk_mali_split_k(uint32_t k) {
+    uint32_t split_k = k >= 2048 ? std::min(CEIL_DIV(k, 768u), 4u) : 1;
+    // ggml_vk_matmul rounds slices up to 256; drop splits that would be empty.
+    while (split_k > 1 && ROUNDUP_POW2(CEIL_DIV(k, split_k), 256) * (split_k - 1) >= k) {
+        split_k--;
+    }
+    return split_k;
+}
+
 static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m, uint32_t n, uint32_t k, bool disable_split_k, const vk_pipeline& pipeline) {
     VK_LOG_DEBUG("ggml_vk_guess_split_k(" << m << ", " << n << ", " << k << ", " << disable_split_k << ")");
 
@@ -9525,6 +9644,37 @@ static void ggml_vk_cpy_to_contiguous(ggml_backend_vk_context * ctx, vk_context&
     ggml_vk_sync_buffers(ctx, subctx);
 }
 
+// Mali matmul operands: copies a tensor whose rows are contiguous f32 or f16
+// into dense f16 rows of dst_stride halves with copy_rows_f16.comp. Returns
+// false when the tensor does not qualify; the caller then uses ggml's cpy.
+static bool ggml_vk_mali_copy_rows(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * tensor,
+                                   vk_buffer & buf, uint64_t offset, const vk_subbuffer & out, uint32_t dst_stride) {
+    const size_t ts = ggml_type_size(tensor->type);
+    vk_pipeline pipeline = tensor->type == GGML_TYPE_F32 ? ctx->device->pipeline_copy_rows_f32_f16 :
+                           tensor->type == GGML_TYPE_F16 ? ctx->device->pipeline_copy_rows_f16_f16 : nullptr;
+    if (!pipeline || tensor->nb[0] != ts || tensor->nb[1] % ts || tensor->nb[2] % ts || tensor->nb[3] % ts ||
+        dst_stride % 8 != 0) {
+        return false;
+    }
+    const uint64_t align = ctx->device->properties.limits.minStorageBufferOffsetAlignment;
+    const uint64_t base = offset / align * align;
+    if ((offset - base) % ts) {
+        return false;
+    }
+    const uint32_t nrows = (uint32_t) (tensor->ne[1] * tensor->ne[2] * tensor->ne[3]);
+    const std::array<uint32_t, 9> pc = {
+        (uint32_t) tensor->ne[0], (uint32_t) tensor->ne[1], (uint32_t) tensor->ne[2],
+        (uint32_t) (tensor->nb[1] / ts), (uint32_t) (tensor->nb[2] / ts), (uint32_t) (tensor->nb[3] / ts),
+        (uint32_t) ((offset - base) / ts), dst_stride, nrows,
+    };
+    const uint32_t rows_y = std::min(nrows, 65535u);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { ggml_vk_subbuffer(ctx, buf, base), out }, pc,
+                              { (uint32_t) tensor->ne[0], rows_y, CEIL_DIV(nrows, rows_y) });
+    ggml_vk_sync_buffers(ctx, subctx);
+    return true;
+}
+
 // Copy/convert tensor into a caller-defined dense layout. Destination strides
 // are in output elements, not bytes.
 static void ggml_vk_cpy_to_strided(
@@ -9642,11 +9792,32 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         src1_uma = d_Qy != nullptr;
     }
 
+    // Mali: f16 matmuls with even K go to mul_mm_mali.comp, which reads rows
+    // with 128-bit loads. Operands it cannot read in place (non-contiguous,
+    // misaligned, f32 activations) are first copied to f16 at offset 0 of the
+    // x/y buffers; when K is not a multiple of 8 both are copied with the row
+    // stride padded to 8 so every row starts 16-byte aligned.
+    const uint64_t src0_offset = src0_uma ? qx_buf_offset : vk_tensor_offset(src0) + src0->view_offs;
+    const uint64_t src1_offset = src1_uma ? qy_buf_offset : vk_tensor_offset(src1) + src1->view_offs;
+    // Planar q5_0 is dequantized to f16 first, and then counts as f16.
+    const bool x_planar = ggml_vk_is_q5_planar(src0);
+    const bool use_mali_mm = ctx->device->pipeline_matmul_mali && (src0->type == GGML_TYPE_F16 || x_planar) &&
+                             (ggml_prec)dst->op_params[0] == GGML_PREC_DEFAULT &&
+                             ne10 % 2 == 0 && ne01 > 8 && ne11 > 1;
+    const uint64_t mali_kpad = use_mali_mm ? ROUNDUP_POW2(ne10, 8) : ne00;
+    const bool mali_pad = mali_kpad != ne10;
+    const bool mali_convert_x = use_mali_mm && !x_planar &&
+                                (mali_pad || !ggml_vk_dim01_contiguous(src0) || src0_offset % 16 != 0);
+    const bool mali_convert_y = use_mali_mm &&
+                                (mali_pad || src1->type != GGML_TYPE_F16 || !ggml_vk_dim01_contiguous(src1) || src1_offset % 16 != 0);
+
     // TODO: Clean up this logic to pick src1 type by capability
     // Reformat and convert to fp16 if non-contiguous, or for coopmat2 for better perf
-    const bool x_non_contig = (ctx->device->coopmat2 && src0->type == GGML_TYPE_F32) ||
+    const bool x_non_contig = mali_convert_x ||
+                              (ctx->device->coopmat2 && src0->type == GGML_TYPE_F32) ||
                               !ggml_vk_dim01_contiguous(src0);
-    const bool y_non_contig = (ctx->device->coopmat2 && src1->type == GGML_TYPE_F32) ||
+    const bool y_non_contig = mali_convert_y ||
+                              (ctx->device->coopmat2 && src1->type == GGML_TYPE_F32) ||
                               // coopmat1: force f32->f16 conversion so the f16 B-type quant pipeline is used.
                               (ctx->device->coopmat_support && !ctx->device->coopmat2 &&
                                ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32) ||
@@ -9658,7 +9829,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     const bool y_f32_kernel = src1->type == GGML_TYPE_F32 && !y_non_contig;
 
-    bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
+    bool quantize_y = !x_planar && ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
 
     // Check for mmq first
     const std::vector<vk_matmul_pipeline_pair>* mmp_map = quantize_y ? ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, GGML_TYPE_Q8_1, (ggml_prec)dst->op_params[0]) : nullptr;
@@ -9669,7 +9840,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         quantize_y = false;
     }
 
-    const bool qx_needs_dequant = mmp_map == nullptr || x_non_contig;
+    const bool qx_needs_dequant = mmp_map == nullptr || x_non_contig || x_planar;
     const bool qy_needs_dequant = !quantize_y && ((src1->type != f16_type && !y_f32_kernel) || y_non_contig);
 
     if (qx_needs_dequant) {
@@ -9687,22 +9858,27 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, ne11, aligned, false);
 
-    if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
+    if (use_mali_mm) {
+        pipeline = ctx->device->pipeline_matmul_mali;
+    } else if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
     }
 
     // Reserve extra storage in the N dimension for the Y matrix, so we can avoid bounds-checking
-    uint32_t padded_n = qy_needs_dequant ? ROUNDUP_POW2(ne11, pipeline->wg_denoms[1]) : ne11;
+    // (the Mali pipeline's tile width is not a power of two).
+    uint32_t padded_n = qy_needs_dequant ? CEIL_DIV(ne11, pipeline->wg_denoms[1]) * pipeline->wg_denoms[1] : ne11;
     const uint64_t x_ne = ggml_nelements(src0);
     // 128 elements per Q8_1 x4 block
-    const uint64_t y_ne = padded_n * ne10 * ne12 * ne13;
+    const uint64_t y_ne = padded_n * mali_kpad * ne12 * ne13;
     const uint64_t d_ne = ggml_nelements(dst);
 
-    const uint32_t split_k = ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k, pipeline);
+    // The Mali pipeline covers all of K in one workgroup.
+    const uint32_t split_k = use_mali_mm ? (disable_split_k ? 1 : ggml_vk_mali_split_k(ne10)) :
+                             ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k, pipeline);
 
     const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
     const uint64_t qy_sz = ggml_type_size(src1->type) * y_ne / ggml_blck_size(src1->type);
-    const uint64_t x_sz = !qx_needs_dequant ? qx_sz : sizeof(ggml_fp16_t) * x_ne;
+    const uint64_t x_sz = !qx_needs_dequant ? qx_sz : sizeof(ggml_fp16_t) * (x_ne / ne10 * mali_kpad);
     const uint64_t y_sz = quantize_y ? (ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1)) : (y_f32_kernel ? sizeof(float) * y_ne : sizeof(ggml_fp16_t) * y_ne);
     const uint64_t d_sz = sizeof(float) * d_ne;
 
@@ -9710,13 +9886,29 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     vk_pipeline to_fp16_vk_1 = nullptr;
     vk_pipeline to_q8_1 = nullptr;
 
-    if (x_non_contig) {
-        to_fp16_vk_0 = ggml_vk_get_cpy_pipeline(ctx, src0, nullptr, f16_type);
+    // Destination layouts for the Mali path's padded copies; describing them
+    // makes the copy pipeline lookup pick the strided (non-contiguous) shader.
+    auto mali_padded_dst = [&](const ggml_tensor * t) {
+        ggml_tensor padded = *t;
+        padded.type = GGML_TYPE_F16;
+        padded.nb[0] = ggml_type_size(GGML_TYPE_F16);
+        padded.nb[1] = padded.nb[0] * mali_kpad;
+        padded.nb[2] = padded.nb[1] * t->ne[1];
+        padded.nb[3] = padded.nb[2] * t->ne[2];
+        return padded;
+    };
+    const ggml_tensor x_padded_dst = mali_padded_dst(src0);
+    const ggml_tensor y_padded_dst = mali_padded_dst(src1);
+
+    if (x_planar) {
+        to_fp16_vk_0 = ctx->device->pipeline_dequant_q5_planar;
+    } else if (x_non_contig) {
+        to_fp16_vk_0 = ggml_vk_get_cpy_pipeline(ctx, src0, mali_pad ? &x_padded_dst : nullptr, f16_type);
     } else {
         to_fp16_vk_0 = ggml_vk_get_to_fp16(ctx, src0->type);
     }
     if (y_non_contig) {
-        to_fp16_vk_1 = ggml_vk_get_cpy_pipeline(ctx, src1, nullptr, f16_type);
+        to_fp16_vk_1 = ggml_vk_get_cpy_pipeline(ctx, src1, mali_pad ? &y_padded_dst : nullptr, f16_type);
     } else {
         to_fp16_vk_1 = ggml_vk_get_to_fp16(ctx, src1->type);
     }
@@ -9763,8 +9955,12 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         }
     }
 
-    vk_buffer d_D = dst_buf_ctx->dev_buffer;
-    const uint64_t d_buf_offset = vk_tensor_offset(dst) + dst->view_offs;
+    // A fused Mali epilogue writes the last fused node instead (same shape).
+    const bool mali_epilogue = use_mali_mm && ctx->mali_epilogue.flags != 0;
+    GGML_ASSERT(!mali_epilogue || split_k == 1);
+    const ggml_tensor * out = mali_epilogue ? ctx->mali_epilogue.out : dst;
+    vk_buffer d_D = mali_epilogue ? ((ggml_backend_vk_buffer_context *)out->buffer->context)->dev_buffer : dst_buf_ctx->dev_buffer;
+    const uint64_t d_buf_offset = vk_tensor_offset(out) + out->view_offs;
     GGML_ASSERT(d_D != nullptr);
     GGML_ASSERT(d_D->size >= d_buf_offset + d_sz);
     vk_buffer d_X;
@@ -9807,7 +10003,12 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         }
     }
 
-    if (x_non_contig) {
+    if (mali_convert_x && ggml_vk_mali_copy_rows(ctx, subctx, src0, d_Qx, qx_buf_offset, ggml_vk_subbuffer(ctx, d_X, 0), (uint32_t)mali_kpad)) {
+        // done
+    } else if (mali_pad) {
+        ggml_vk_cpy_to_strided(ctx, subctx, to_fp16_vk_0, src0, ggml_vk_subbuffer(ctx, d_Qx, qx_buf_offset), ggml_vk_subbuffer(ctx, d_X, 0),
+                               1, (uint32_t)mali_kpad, (uint32_t)(mali_kpad * ne01), (uint32_t)(mali_kpad * ne01 * ne02));
+    } else if (x_non_contig) {
         ggml_vk_cpy_to_contiguous(ctx, subctx, to_fp16_vk_0, src0, ggml_vk_subbuffer(ctx, d_Qx, qx_buf_offset), ggml_vk_subbuffer(ctx, d_X, 0));
     } else if (qx_needs_dequant) {
         const std::vector<uint32_t> pc = { (uint32_t)ne01, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)(ggml_nelements(src0)) };
@@ -9817,14 +10018,21 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     if (y_non_contig) {
         if (ctx->prealloc_y_last_pipeline_used != to_fp16_vk_1.get() ||
             ctx->prealloc_y_last_tensor_used != src1 ||
-            ctx->prealloc_y_last_k_padded) {
+            ctx->prealloc_y_last_k_padded != mali_pad) {
             if (ctx->prealloc_y_need_sync) {
                 ggml_vk_sync_buffers(ctx, subctx);
             }
-            ggml_vk_cpy_to_contiguous(ctx, subctx, to_fp16_vk_1, src1, ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0));
+            if (mali_convert_y && ggml_vk_mali_copy_rows(ctx, subctx, src1, d_Qy, qy_buf_offset, ggml_vk_subbuffer(ctx, d_Y, 0), (uint32_t)mali_kpad)) {
+                // done
+            } else if (mali_pad) {
+                ggml_vk_cpy_to_strided(ctx, subctx, to_fp16_vk_1, src1, ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0),
+                                       1, (uint32_t)mali_kpad, (uint32_t)(mali_kpad * ne11), (uint32_t)(mali_kpad * ne11 * ne12));
+            } else {
+                ggml_vk_cpy_to_contiguous(ctx, subctx, to_fp16_vk_1, src1, ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0));
+            }
             ctx->prealloc_y_last_pipeline_used = to_fp16_vk_1.get();
             ctx->prealloc_y_last_tensor_used = src1;
-            ctx->prealloc_y_last_k_padded = false;
+            ctx->prealloc_y_last_k_padded = mali_pad;
         }
     }
     if (quantize_y) {
@@ -9841,8 +10049,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         }
     }
 
-    uint32_t stride_batch_x = ne00*ne01;
-    uint32_t stride_batch_y = ne10*ne11;
+    uint32_t stride_batch_x = mali_kpad*ne01;
+    uint32_t stride_batch_y = mali_kpad*ne11;
 
     if (!ggml_vk_dim01_contiguous(src0) && !qx_needs_dequant) {
         stride_batch_x = src0->nb[0] / ggml_type_size(src0->type);
@@ -9853,12 +10061,31 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     }
 
     // compute
+    if (mali_epilogue) {
+        struct {
+            vk_mat_mat_push_constants mm;
+            uint32_t epilogue;
+        } pc = {
+            { (uint32_t)ne01, (uint32_t)ne11, (uint32_t)ne10, (uint32_t)mali_kpad, (uint32_t)mali_kpad, (uint32_t)stride_d,
+              (uint32_t)stride_batch_x, (uint32_t)stride_batch_y, (uint32_t)stride_batch_d, 0, (uint32_t)(ne12*ne13), (uint32_t)ne10,
+              (uint32_t)ne02, (uint32_t)ne12, (uint32_t)r2, (uint32_t)r3, padded_n },
+            ctx->mali_epilogue.flags,
+        };
+        vk_pipeline epi = ctx->device->pipeline_matmul_mali_epilogue;
+        const ggml_tensor * bias = ctx->mali_epilogue.bias;
+        const ggml_tensor * resid = ctx->mali_epilogue.resid ? ctx->mali_epilogue.resid : bias;
+        ggml_pipeline_request_descriptor_sets(ctx, epi, 1);
+        ggml_vk_dispatch_pipeline(ctx, subctx, epi,
+            { vk_subbuffer{ d_X, x_buf_offset, x_sz }, vk_subbuffer{ d_Y, y_buf_offset, y_sz }, ggml_vk_subbuffer(ctx, d_D, d_buf_offset),
+              ggml_vk_tensor_subbuffer(ctx, bias), ggml_vk_tensor_subbuffer(ctx, resid) },
+            pc, { (uint32_t)ne01, (uint32_t)ne11, (uint32_t)(ne12*ne13) });
+    } else
     ggml_vk_matmul(
         ctx, subctx, pipeline,
         { d_X, x_buf_offset, x_sz }, { d_Y, y_buf_offset, y_sz },
         ggml_vk_subbuffer(ctx, d_D, d_buf_offset), { ctx->prealloc_split_k, 0, d_sz * split_k },
         ne01, ne11, ne10,
-        ne10, ne10, stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
+        mali_kpad, mali_kpad, stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
         split_k, ne12*ne13, ne02, ne12, r2, r3, padded_n
     );  // NOLINT
 
@@ -9991,7 +10218,8 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     const bool y_non_contig = !ggml_vk_dim01_contiguous(src1);
 
     const bool f16_f32_kernel = src1->type == GGML_TYPE_F32;
-    bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_should_use_mmvq(ctx->device, ne01, ne11, ne10, src0->type);
+    const bool x_planar = ggml_vk_is_q5_planar(src0);
+    bool quantize_y = !x_planar && ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_should_use_mmvq(ctx->device, ne01, ne11, ne10, src0->type);
 
     vk_pipeline to_fp16_vk_0 = nullptr;
     vk_pipeline to_fp16_vk_1 = nullptr;
@@ -10161,6 +10389,20 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
 
         d_F1 = ggml_vk_tensor_subbuffer(ctx, bias);
         fusion_flags |= MAT_VEC_FUSION_FLAGS_BIAS1;
+    }
+
+    if (x_planar) {
+        GGML_ASSERT(ne11 == 1 && !swap_inputs && !y_non_contig && src1->type == GGML_TYPE_F32 && ne02 == 1 && ne03 == 1);
+        dmmv = ctx->device->pipeline_mul_mat_vec_q5_planar;
+    }
+
+    // Mali: one f16 x f32 column goes to mul_mat_vec_mali.comp, which reads A
+    // and x with 128-bit loads from 16-byte aligned offsets.
+    if (ctx->device->pipeline_mul_mat_vec_mali && src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 &&
+        ne11 == 1 && !swap_inputs && !x_non_contig && !y_non_contig && !quantize_y &&
+        ne00 % 8 == 0 && stride_batch_x % 8 == 0 && stride_batch_y % 4 == 0 &&
+        d_X.offset % 16 == 0 && d_Y.offset % 16 == 0) {
+        dmmv = ctx->device->pipeline_mul_mat_vec_mali;
     }
 
     ggml_pipeline_request_descriptor_sets(ctx, dmmv, CEIL_DIV(ne12 * ne13, ctx->device->properties.limits.maxComputeWorkGroupCount[1]));
@@ -10547,6 +10789,19 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
     // This only supports batchsize == 1.
     const size_t nbytes = ggml_nbytes(src0);
     const bool needs_split = dst->ne[2] == 1 && dst->ne[3] == 1 && nbytes > ctx->device->properties.limits.maxStorageBufferRange;
+    // Planar q5_0 weights: the mat-vec kernel for one contiguous f32 column,
+    // otherwise dequantize to f16 and multiply.
+    if (ggml_vk_uses_q5_planar(src0)) {
+        GGML_ASSERT(ggml_vk_is_q5_planar(src0) && "views of planar q5_0 tensors are not supported");
+        if (dst->ne[1] == 1 && src1->type == GGML_TYPE_F32 && ggml_vk_dim01_contiguous(src1)) {
+            ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx);
+        } else {
+            GGML_ASSERT(ctx->num_additional_fused_ops == 0 || ctx->mali_epilogue.flags != 0);
+            ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, false);
+        }
+        return;
+    }
+
     if (needs_split) {
         // Choose the number of rows that can fit (and divide by two, to allow for any additional offsets)
         const uint32_t M_split = ctx->device->properties.limits.maxStorageBufferRange / (2 * src0->nb[1]);
@@ -10601,7 +10856,9 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx, true);
     // mul_mat_vec supports batching ne12*ne13 when ne11==1, or treating ne11 as the batch size (up to four)
     // when ne12 and ne13 are one.
-    } else if ((dst->ne[1] == 1 || (dst->ne[1] <= mul_mat_vec_max_cols && src1->ne[2] * src1->ne[3] == 1)) &&
+    } else if ((dst->ne[1] == 1 || (dst->ne[1] <= mul_mat_vec_max_cols && src1->ne[2] * src1->ne[3] == 1 &&
+                                    // Mali: a few f16 columns run faster in mul_mm_mali.comp.
+                                    !(ctx->device->pipeline_matmul_mali && src0->type == GGML_TYPE_F16))) &&
                (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type))) {
         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx);
     } else {
@@ -12977,6 +13234,22 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
 }
 
 static void ggml_vk_get_rows(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (ggml_vk_uses_q5_planar(src0)) {
+        // Rows of a planar q5_0 matrix, selected by a contiguous 1-D index.
+        GGML_ASSERT(ggml_vk_is_q5_planar(src0) && src1->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(src1) && ggml_nrows(src1) == 1 && src0->ne[2] == 1 && src0->ne[3] == 1);
+        vk_pipeline pipeline = ctx->device->pipeline_get_rows_q5_planar;
+        struct {
+            uint32_t ncols, n_blocks, n_rows, dst_stride;
+        } pc = {
+            (uint32_t)src0->ne[0], (uint32_t)(ggml_nelements(src0) / 32), (uint32_t)src1->ne[0], (uint32_t)(dst->nb[1] / sizeof(float)),
+        };
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            { ggml_vk_tensor_subbuffer(ctx, src0), ggml_vk_tensor_subbuffer(ctx, src1), ggml_vk_tensor_subbuffer(ctx, dst) },
+            pc, { (uint32_t)(src0->ne[0] / 32), (uint32_t)src1->ne[0], 1 });
+        return;
+    }
     const uint32_t src0_type_size = ggml_type_size(src0->type);
     const uint32_t src1_type_size = ggml_type_size(src1->type);
     const uint32_t dst_type_size = ggml_type_size(dst->type);
@@ -13993,6 +14266,29 @@ static void ggml_vk_rms_norm_finish(ggml_backend_vk_context * ctx, const ggml_te
     }
 }
 
+// NORM -> MUL(weight) -> ADD(bias), see ggml_vk_can_fuse_norm_mul_add.
+static void ggml_vk_norm_mul_add(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * norm = cgraph->nodes[node_idx];
+    const ggml_tensor * mul = cgraph->nodes[node_idx + 1];
+    ggml_tensor * add = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * src0 = norm->src[0];
+    const ggml_tensor * weight = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+    const ggml_tensor * bias = add->src[0] == mul ? add->src[1] : add->src[0];
+
+    vk_op_binary_push_constants pc = ggml_vk_rms_norm_push_constants(src0, weight, add, ggml_get_op_params_f32(norm, 0), 0);
+    init_pushconst_tensor_offsets(ctx, pc, src0, weight, nullptr, nullptr, add);
+
+    vk_pipeline pipeline = ctx->device->pipeline_norm_mul_add_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {
+            ggml_vk_tensor_subbuffer(ctx, src0, true),
+            ggml_vk_tensor_subbuffer(ctx, weight, true),
+            ggml_vk_tensor_subbuffer(ctx, add, true),
+            ggml_vk_tensor_subbuffer(ctx, bias),
+        }, pc, { (uint32_t)src0->ne[1], (uint32_t)src0->ne[2], (uint32_t)src0->ne[3] });
+}
+
 static void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx, float * op_params) {
     ggml_tensor * rms = cgraph->nodes[node_idx];
     const ggml_tensor * src0 = rms->src[0];
@@ -14244,6 +14540,32 @@ static void ggml_vk_glu(ggml_backend_vk_context * ctx, vk_context& subctx, const
 static void ggml_vk_diag_mask_inf(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
     int32_t * op_params = (int32_t *)dst->op_params;
     ggml_vk_op_f32<vk_op_diag_mask_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_DIAG_MASK_INF, { (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], op_params[0] });
+}
+
+// Mali: an unmasked softmax of rows up to 2048 wide (the encoder's attention
+// and the decoder's cross-attention) goes to soft_max_mali.comp.
+static bool ggml_vk_soft_max_mali_ok(const ggml_backend_vk_context * ctx, const ggml_tensor * soft_max) {
+    const ggml_tensor * src0 = soft_max->src[0];
+    return ctx->device->pipeline_soft_max_mali_f32 && soft_max->src[1] == nullptr && soft_max->src[2] == nullptr &&
+           ggml_get_op_params_f32(soft_max, 1) == 0.0f && src0->type == GGML_TYPE_F32 && soft_max->type == GGML_TYPE_F32 &&
+           ggml_is_contiguous(src0) && ggml_is_contiguous(soft_max) && src0->ne[0] <= 128 * 16 &&
+           get_misalign_bytes(ctx, src0) == 0 && get_misalign_bytes(ctx, soft_max) == 0;
+}
+
+// dst is the softmax itself (f32) or the cast of it to f16 fused into it.
+static void ggml_vk_soft_max_mali(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * soft_max, ggml_tensor * dst) {
+    const ggml_tensor * src0 = soft_max->src[0];
+    const uint32_t nrows = (uint32_t) ggml_nrows(src0);
+    const std::array<uint32_t, 3> pc = { (uint32_t) src0->ne[0], nrows, 0 };
+    std::array<uint32_t, 3> pc_scale = pc;
+    const float scale = ggml_get_op_params_f32(soft_max, 0);
+    memcpy(&pc_scale[2], &scale, sizeof(float));
+
+    vk_pipeline pipeline = dst->type == GGML_TYPE_F16 ? ctx->device->pipeline_soft_max_mali_f16 : ctx->device->pipeline_soft_max_mali_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    const uint32_t groups_x = std::min(nrows, 65535u);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { ggml_vk_tensor_subbuffer(ctx, src0), ggml_vk_tensor_subbuffer(ctx, dst) },
+                              pc_scale, { groups_x, CEIL_DIV(nrows, groups_x), 1 });
 }
 
 static void ggml_vk_soft_max(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, ggml_tensor * dst) {
@@ -16415,7 +16737,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
     case GGML_OP_NORM:
-        ggml_vk_norm(ctx, compute_ctx, src0, node);
+        if (ctx->fused_norm_mul_add) {
+            ggml_vk_norm_mul_add(ctx, compute_ctx, cgraph, node_idx);
+        } else {
+            ggml_vk_norm(ctx, compute_ctx, src0, node);
+        }
 
         break;
     case GGML_OP_GROUP_NORM:
@@ -16496,6 +16822,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     case GGML_OP_SOFT_MAX:
         if (ctx->fused_topk_moe_mode != TOPK_MOE_COUNT) {
             ggml_vk_topk_moe(ctx, compute_ctx, cgraph, node_idx);
+        } else if (ctx->fused_soft_max_f16) {
+            ggml_vk_soft_max_mali(ctx, compute_ctx, node, cgraph->nodes[node_idx + 1]);
+        } else if (ggml_vk_soft_max_mali_ok(ctx, node)) {
+            ggml_vk_soft_max_mali(ctx, compute_ctx, node, node);
         } else {
             ggml_vk_soft_max(ctx, compute_ctx, src0, src1, src2, node);
         }
@@ -16917,6 +17247,22 @@ static void ggml_backend_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml
         return;
     }
 
+    // Whole 2-D q5_0 tensors are stored planar (see ggml_vk_q5_planar_repack).
+    // Matrices of fewer than 16 rows stay in ggml's layout: they are not model
+    // weights, and their matmuls take ggml's small-tile path, which the planar
+    // dequant does not feed.
+    if (buf->device->q5_planar && tensor->type == GGML_TYPE_Q5_0 && tensor->view_src == nullptr &&
+        ggml_is_contiguous(tensor) && tensor->ne[1] >= 16 && tensor->ne[2] == 1 && tensor->ne[3] == 1 &&
+        offset == 0 && size == ggml_nbytes(tensor) &&
+        (vk_tensor_offset(tensor) % 16) == 0) {
+        std::vector<uint8_t> planar(size);
+        ggml_vk_q5_planar_repack((const uint8_t *)data, planar.data(), size / Q5_0_BLOCK);
+        ggml_vk_buffer_write(buf, vk_tensor_offset(tensor), planar.data(), size);
+        tensor->extra = &vk_q5_planar_marker;
+        return;
+    }
+    GGML_ASSERT(!ggml_vk_uses_q5_planar(tensor) && "partial writes to planar q5_0 tensors are not supported");
+
     ggml_vk_buffer_write(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
 }
 
@@ -16930,6 +17276,7 @@ static void ggml_backend_vk_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, g
     if (size == 0) {
         return;
     }
+    GGML_ASSERT(!ggml_vk_uses_q5_planar(tensor) && "2-D writes to planar q5_0 tensors are not supported");
 
     ggml_vk_buffer_write_2d(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, stride_data, stride_tensor, size, n_copies);
 }
@@ -16944,6 +17291,17 @@ static void ggml_backend_vk_buffer_get_tensor(ggml_backend_buffer_t buffer, cons
 
     vk_buffer buf = buf_ctx->dev_buffer;
 
+    if (ggml_vk_is_q5_planar(tensor)) {
+        // Read back in the standard q5_0 layout.
+        const size_t n = ggml_nbytes(tensor);
+        std::vector<uint8_t> planar(n), blocks(n);
+        ggml_vk_buffer_read(buf, vk_tensor_offset(tensor), planar.data(), n);
+        ggml_vk_q5_planar_unpack(planar.data(), blocks.data(), n / Q5_0_BLOCK);
+        memcpy(data, blocks.data() + offset, size);
+        return;
+    }
+    GGML_ASSERT(!ggml_vk_uses_q5_planar(tensor) && "reads of views of planar q5_0 tensors are not supported");
+
     ggml_vk_buffer_read(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
 }
 
@@ -16956,6 +17314,7 @@ static void ggml_backend_vk_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, c
     if (size == 0) {
         return;
     }
+    GGML_ASSERT(!ggml_vk_uses_q5_planar(tensor) && "2-D reads of planar q5_0 tensors are not supported");
 
     vk_buffer buf = buf_ctx->dev_buffer;
 
@@ -16965,6 +17324,10 @@ static void ggml_backend_vk_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, c
 static bool ggml_backend_vk_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
     if (ggml_nbytes(src) == 0) {
         return true;
+    }
+    if (ggml_vk_uses_q5_planar(src)) {
+        // Let ggml-backend copy through the host, which unpacks it.
+        return false;
     }
 
     if (ggml_backend_buffer_is_vk(src->buffer)) {
@@ -17207,6 +17570,13 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
 
 static void ggml_backend_vk_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     VK_LOG_DEBUG("ggml_backend_vk_set_tensor_async(" << size << ")");
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    if (ctx->device->q5_planar && tensor->type == GGML_TYPE_Q5_0 && ggml_backend_buffer_is_vk(tensor->buffer)) {
+        // Planar q5_0 is repacked on the host; write synchronously.
+        ggml_vk_synchronize(ctx);
+        ggml_backend_vk_buffer_set_tensor(tensor->buffer, tensor, data, offset, size);
+        return;
+    }
     ggml_backend_vk_set_tensor_2d_async(backend, tensor, data, offset, size, 1, size, size);
 }
 
@@ -17263,6 +17633,12 @@ static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const gg
 
 static void ggml_backend_vk_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     VK_LOG_DEBUG("ggml_backend_vk_get_tensor_async(" << size << ")");
+    if (ggml_vk_uses_q5_planar(tensor)) {
+        // Planar q5_0 is unpacked on the host; read synchronously.
+        ggml_vk_synchronize((ggml_backend_vk_context *)backend->context);
+        ggml_backend_vk_buffer_get_tensor(tensor->buffer, tensor, data, offset, size);
+        return;
+    }
     ggml_backend_vk_get_tensor_2d_async(backend, tensor, data, offset, size, 1, size, size);
 }
 
@@ -17458,6 +17834,99 @@ static bool ggml_vk_can_fuse_unary_mul_pair(const struct ggml_cgraph * cgraph, i
            ggml_vk_can_fuse_unary_mul(cgraph, node_idx, node_idx + 1);
 }
 
+static bool ggml_vk_soft_max_mali_ok(const ggml_backend_vk_context * ctx, const ggml_tensor * soft_max);
+
+// Mali matmul epilogue: MUL_MAT -> ADD(bias vector of M) [-> ADD(residual) |
+// -> GELU], for products that take mul_mm_mali.comp unsplit (the encoder's
+// Q/V/O projections and fc1). Returns the number of fused ops after the
+// MUL_MAT (0: no fusion) and fills ctx->mali_epilogue.
+static int ggml_vk_can_fuse_mali_mm_epilogue(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * mul = cgraph->nodes[node_idx];
+    if (!ctx->device->pipeline_matmul_mali_epilogue || mul->op != GGML_OP_MUL_MAT ||
+        node_idx + 1 >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * src0 = mul->src[0];
+    const ggml_tensor * src1 = mul->src[1];
+    // Only shapes that ggml_vk_mul_mat sends to ggml_vk_mul_mat_q_f16 with the
+    // Mali pipeline and without split-k (ggml_vk_mali_split_k).
+    const bool mali_src0 = (src0->type == GGML_TYPE_F16 && ggml_is_contiguous(src0)) || ggml_vk_is_q5_planar(src0);
+    if (!mali_src0 || src1->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || (ggml_prec) mul->op_params[0] != GGML_PREC_DEFAULT ||
+        src0->ne[0] % 2 != 0 || src0->ne[1] <= 8 || src1->ne[1] < 16 || src0->ne[0] >= 2048 ||
+        src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || !ggml_is_contiguous(mul) ||
+        ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
+        return 0;
+    }
+    auto other = [](const ggml_tensor * op, const ggml_tensor * in) {
+        return op->src[0] == in ? op->src[1] : op->src[0];
+    };
+    auto plain_f32 = [&](const ggml_tensor * t) {
+        return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && get_misalign_bytes(ctx, t) == 0;
+    };
+    if (!ggml_can_fuse(cgraph, node_idx, { GGML_OP_MUL_MAT, GGML_OP_ADD })) {
+        return 0;
+    }
+    const ggml_tensor * add = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * bias = other(add, mul);
+    if ((add->src[0] != mul && add->src[1] != mul) || !plain_f32(bias) || !plain_f32(add) ||
+        bias->ne[0] != mul->ne[0] || ggml_nrows(bias) != 1 || !ggml_are_same_shape(add, mul)) {
+        return 0;
+    }
+    ctx->mali_epilogue = { 1u, bias, nullptr, cgraph->nodes[node_idx + 1] };
+    if (node_idx + 2 < cgraph->n_nodes) {
+        const ggml_tensor * next = cgraph->nodes[node_idx + 2];
+        if (next->op == GGML_OP_ADD && ggml_can_fuse(cgraph, node_idx, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD })) {
+            const ggml_tensor * resid = other(next, add);
+            if ((next->src[0] == add || next->src[1] == add) && plain_f32(resid) && plain_f32(next) &&
+                ggml_are_same_shape(resid, mul) && ggml_are_same_shape(next, mul)) {
+                ctx->mali_epilogue = { 1u | 2u, bias, resid, cgraph->nodes[node_idx + 2] };
+                return 2;
+            }
+        }
+        if (next->op == GGML_OP_UNARY && ggml_get_unary_op(next) == GGML_UNARY_OP_GELU && next->src[0] == add &&
+            plain_f32(next) && ggml_can_fuse(cgraph, node_idx, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_UNARY })) {
+            ctx->mali_epilogue = { 1u | 4u, bias, nullptr, cgraph->nodes[node_idx + 2] };
+            return 2;
+        }
+    }
+    return 1;
+}
+
+// SOFT_MAX -> CPY to f16 of the same shape, on Mali (ggml_vk_soft_max_mali).
+static bool ggml_vk_can_fuse_soft_max_f16(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_can_fuse(cgraph, node_idx, { GGML_OP_SOFT_MAX, GGML_OP_CPY })) {
+        return false;
+    }
+    const ggml_tensor * soft_max = cgraph->nodes[node_idx];
+    const ggml_tensor * cpy = cgraph->nodes[node_idx + 1];
+    return ggml_vk_soft_max_mali_ok(ctx, soft_max) && cpy->src[0] == soft_max && cpy->type == GGML_TYPE_F16 &&
+           ggml_are_same_shape(soft_max, cpy) && ggml_is_contiguous(cpy) && get_misalign_bytes(ctx, cpy) == 0;
+}
+
+// NORM -> MUL -> ADD where the weight and bias are f32 vectors of ne00
+// (a LayerNorm), on contiguous f32 rows.
+static bool ggml_vk_can_fuse_norm_mul_add(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ctx->device->pipeline_norm_mul_add_f32 || !ggml_can_fuse(cgraph, node_idx, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
+        return false;
+    }
+    const ggml_tensor * norm = cgraph->nodes[node_idx];
+    const ggml_tensor * mul = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * add = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * src0 = norm->src[0];
+    if (add->src[0] != mul && add->src[1] != mul) {
+        return false;
+    }
+    const ggml_tensor * weight = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+    const ggml_tensor * bias = add->src[0] == mul ? add->src[1] : add->src[0];
+    auto is_row_vector = [&](const ggml_tensor * t) {
+        return t->type == GGML_TYPE_F32 && t->ne[0] == src0->ne[0] && ggml_nrows(t) == 1 && ggml_is_contiguous(t);
+    };
+    return src0->type == GGML_TYPE_F32 && norm->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 &&
+           add->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(src0) && ggml_is_contiguous(add) &&
+           ggml_are_same_shape(src0, add) && is_row_vector(weight) && is_row_vector(bias) &&
+           get_misalign_bytes(ctx, bias) == 0;
+}
+
 static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_UNARY && ops.begin()[1] == GGML_OP_MUL) {
         return ggml_vk_can_fuse_unary_mul_pair(cgraph, node_idx);
@@ -17534,6 +18003,11 @@ static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct g
 
         // mat-vec only
         if (ggml_nrows(mul) != 1) {
+            return false;
+        }
+        // planar q5_0 weights take the fused mat-vec path only with contiguous f32 vectors
+        if (ggml_vk_uses_q5_planar(mul->src[0]) &&
+            (mul->src[1]->type != GGML_TYPE_F32 || !ggml_vk_dim01_contiguous(mul->src[1]))) {
             return false;
         }
         // shaders assume the types match
@@ -18253,6 +18727,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     }
     uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
 
+    // Mali: submit after the first few recorded nodes so the GPU starts at
+    // once, then let each batch grow 6x (recording a node is several times
+    // faster than running it, so the GPU does not wait for the next batch).
+    // The flop and node-count triggers left the GPU idle while ~80% of a
+    // decoder graph was recorded.
+    const bool submit_ramp = ctx->device->vendor_id == VK_VENDOR_ID_ARM;
+    uint32_t submit_ramp_nodes = 4;
+
     auto const submit_after = [&](int start, int end) {
         if (ctx->device->serialize_submissions) {
             try {
@@ -18281,6 +18763,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             flops_per_submit *= 2;
         }
         submit_count++;
+        submit_ramp_nodes *= 6;
     };
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -18293,7 +18776,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             total_flops += node_flops;
 
             // Flush the current batch before recording a node that would push it over the flop threshold
-            if (flops_per_submit != 0 && submitted_nodes > 0 && batch_flops + node_flops >= flops_per_submit) {
+            if (!submit_ramp && flops_per_submit != 0 && submitted_nodes > 0 && batch_flops + node_flops >= flops_per_submit) {
                 vk_context flush_ctx = ggml_vk_get_compute_ctx(ctx);
                 ggml_vk_ctx_end(flush_ctx);
                 flush_ctx->exit_tensor_idx = -1;
@@ -18316,10 +18799,31 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_moe_scale = false;
         ctx->fused_topk_qsa = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
+        ctx->fused_norm_mul_add = false;
+        ctx->fused_soft_max_f16 = false;
+        ctx->mali_epilogue = {};
         const char *fusion_string {};
+        int mali_epilogue_ops = 0;
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
-            if (num_adds) {
+            if ((mali_epilogue_ops = ggml_vk_can_fuse_mali_mm_epilogue(ctx, cgraph, i)) > 0) {
+                ctx->num_additional_fused_ops = mali_epilogue_ops;
+                fusion_string = mali_epilogue_ops == 1 ? "MUL_MAT_ADD (Mali)" : "MUL_MAT_ADD_EPILOGUE (Mali)";
+                // the output is written in the matmul's store, element by element
+                op_srcs_fused_elementwise[0] = false;
+                std::fill_n(op_srcs_fused_elementwise + 1, mali_epilogue_ops, true);
+            } else if (ggml_vk_can_fuse_soft_max_f16(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 1;
+                ctx->fused_soft_max_f16 = true;
+                fusion_string = "SOFT_MAX_CPY";
+                std::fill_n(op_srcs_fused_elementwise, 2, true);
+            } else if (ggml_vk_can_fuse_norm_mul_add(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 2;
+                ctx->fused_norm_mul_add = true;
+                fusion_string = "NORM_MUL_ADD";
+                // whole rows are done by one workgroup, as for rms_norm
+                std::fill_n(op_srcs_fused_elementwise, 3, true);
+            } else if (num_adds) {
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
@@ -18550,14 +19054,18 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_scale = false;
                 ctx->fused_topk_qsa = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
+                ctx->fused_norm_mul_add = false;
+                ctx->fused_soft_max_f16 = false;
+                ctx->mali_epilogue = {};
                 fusion_string = nullptr;
             }
         }
 
         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)
         bool almost_ready = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
-        bool submit = (submitted_nodes >= ctx->device->max_nodes_per_submit) ||
-                      (flops_per_submit != 0 && batch_flops >= flops_per_submit) ||
+        bool submit = (submit_ramp ? submitted_nodes + 1 >= submit_ramp_nodes :
+                           (submitted_nodes >= ctx->device->max_nodes_per_submit) ||
+                           (flops_per_submit != 0 && batch_flops >= flops_per_submit)) ||
                       (i + ctx->num_additional_fused_ops >= last_node) ||
                       (almost_ready && !ctx->almost_ready_fence_pending);
 
