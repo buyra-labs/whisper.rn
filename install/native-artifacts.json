@@ -1,4 +1,5 @@
 {
+  "releaseBaseUrl": "https://github.com/mybigday/whisper.rn/releases/download/v0.8.0-rc.1",
   "artifacts": [
     {
       "name": "android-jni-libs",

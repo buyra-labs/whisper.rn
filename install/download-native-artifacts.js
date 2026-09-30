@@ -34,7 +34,11 @@ function normalizeRepositoryUrl(repository) {
   return rawUrl.replace(/^git\+/, '').replace(/\.git$/, '').replace(/\/$/, '')
 }
 
-const releaseBaseUrl = `${normalizeRepositoryUrl(packageJson.repository)}/releases/download/v${packageJson.version}`
+// A fork can take the prebuilt libraries of the upstream release it is based
+// on (native-artifacts.json's releaseBaseUrl) instead of its own releases.
+const releaseBaseUrl =
+  manifest.releaseBaseUrl ||
+  `${normalizeRepositoryUrl(packageJson.repository)}/releases/download/v${packageJson.version}`
 
 function resolvePackagePath(relativePath) {
   return path.join(packageRoot, relativePath)
