@@ -21,6 +21,22 @@ if (RNWHISPER_CCACHE AND NOT CMAKE_C_COMPILER_LAUNCHER)
     endif ()
 endif ()
 
+# --- Vulkan ------------------------------------------------------------------
+# The rnwhisper_v8fp16_va_2_vulkan variant (arm64-v8a) carries ggml's Vulkan
+# backend (cmake/rnwhisper-vulkan.cmake). There is no prebuilt of it: it is
+# compiled from the vendored sources in every build, next to the prebuilt
+# CPU and Hexagon cores.
+option(RNWHISPER_VULKAN "Build the Vulkan GPU variant (arm64-v8a)" ON)
+
+# Whether core ${name} is compiled here rather than taken from jniLibs.
+function(rnwhisper_variant_from_source name result)
+    if (RNWHISPER_BUILD_FROM_SOURCE OR "${name}" MATCHES "_vulkan$")
+        set(${result} TRUE PARENT_SCOPE)
+    else ()
+        set(${result} FALSE PARENT_SCOPE)
+    endif ()
+endfunction()
+
 # --- variant selection -------------------------------------------------------
 # An empty value (the default) builds every variant; CI narrows this down to the
 # ones that exercise distinct code paths.
@@ -63,6 +79,9 @@ function(rnwhisper_android_variants out_var)
             "rnwhisper_v8fp16_va_2|arm|-march=armv8.2-a+fp16"
             "rnwhisper_v8|arm|-march=armv8-a"
         )
+        if (RNWHISPER_VULKAN)
+            list(PREPEND variants "rnwhisper_v8fp16_va_2_vulkan|arm|-march=armv8.2-a+fp16")
+        endif ()
     elseif (ANDROID_ABI STREQUAL "armeabi-v7a")
         list(APPEND variants "rnwhisper_vfpv4|arm|-mfpu=neon-vfpv4")
     elseif (ANDROID_ABI STREQUAL "x86_64")

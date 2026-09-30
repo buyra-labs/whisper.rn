@@ -46,6 +46,11 @@ function(build_rnwhisper_library target_name arch cpu_flags)
         message(STATUS "Skipping ${target_name} - not in RNWHISPER_ANDROID_VARIANTS")
         return()
     endif ()
+    rnwhisper_variant_from_source(${target_name} FROM_SOURCE)
+    if (NOT RNWHISPER_STANDALONE_BUILD AND NOT FROM_SOURCE)
+        # the JNI wrapper links the prebuilt jniLibs core
+        return()
+    endif ()
 
     set(ENABLE_HEXAGON OFF)
     if (${target_name} MATCHES "_hexagon$")
@@ -116,6 +121,11 @@ function(build_rnwhisper_library target_name arch cpu_flags)
         )
         target_link_libraries(${target_name} PRIVATE dl)
         target_compile_options(${target_name} PRIVATE -DGGML_USE_HEXAGON)
+    endif ()
+
+    if (${target_name} MATCHES "_vulkan$")
+        include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/rnwhisper-vulkan.cmake)
+        rnwhisper_add_vulkan_backend(${target_name})
     endif ()
 
     target_compile_options(${target_name} PRIVATE -O3 -DNDEBUG)

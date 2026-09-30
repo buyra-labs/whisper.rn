@@ -8,6 +8,8 @@ cmake_minimum_required(VERSION 3.16)
 #     postinstall from the matching GitHub release (install/download-native-artifacts.js)
 #   - from source (-DRNWHISPER_BUILD_FROM_SOURCE=ON, gradle rnwhisperBuildFromSource=true):
 #     the core is built here as a subdirectory
+#   - the Vulkan core (rnwhisper_v8fp16_va_2_vulkan) has no prebuilt and is always
+#     built here (cmake/rnwhisper-vulkan.cmake)
 project(whisper.rn)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -38,6 +40,8 @@ else ()
             "Run `npx whisper-rn-download-artifacts` (the package's postinstall) to fetch them, "
             "or set `rnwhisperBuildFromSource=true` in android/gradle.properties to build from source.")
     endif ()
+    # cores without a prebuilt (the Vulkan variant) are compiled either way
+    add_subdirectory(rnwhisper)
 endif ()
 
 find_library(LOG_LIB log)
@@ -56,7 +60,8 @@ function(build_rnwhisper_jni jni_name core_name)
         return()
     endif ()
 
-    if (RNWHISPER_BUILD_FROM_SOURCE)
+    rnwhisper_variant_from_source(${core_name} FROM_SOURCE)
+    if (FROM_SOURCE)
         if (NOT TARGET ${core_name})
             # e.g. the Hexagon variant without the SDK on the build host
             message(STATUS "Skipping ${jni_name} - ${core_name} is not built")
@@ -97,7 +102,7 @@ function(build_rnwhisper_jni jni_name core_name)
         )
     endif ()
 
-    if (RNWHISPER_BUILD_FROM_SOURCE)
+    if (FROM_SOURCE)
         target_link_libraries(${jni_name} PRIVATE ${core_name})
     else ()
         # Linking the .so by path records its SONAME (lib${core_name}.so) as
@@ -114,6 +119,9 @@ function(build_rnwhisper_jni jni_name core_name)
     # jni.cpp reports the Hexagon device only in the variant that carries it.
     if (${core_name} MATCHES "_hexagon$")
         target_compile_options(${jni_name} PRIVATE -DGGML_USE_HEXAGON)
+    endif ()
+    if (${core_name} MATCHES "_vulkan$")
+        target_compile_options(${jni_name} PRIVATE -DGGML_USE_VULKAN)
     endif ()
 
     if (CMAKE_BUILD_TYPE AND CMAKE_BUILD_TYPE STREQUAL "Debug")

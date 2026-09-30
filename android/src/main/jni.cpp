@@ -14,6 +14,9 @@
 
 #include "whisper.h"
 #include "ggml-backend.h"
+#ifdef GGML_USE_VULKAN
+#include "ggml-vulkan.h"
+#endif
 #include "rn-whisper.h"
 #include "RNWhisperJSI.h"
 
@@ -611,20 +614,58 @@ void setAndroidContext(JNIEnv *env, jobject applicationContext, jobject assetMan
 
     g_applicationContext = env->NewGlobalRef(applicationContext);
     g_assetManager = env->NewGlobalRef(assetManager);
+
+#ifdef GGML_USE_VULKAN
+    // Compiled GPU pipelines are kept in the code cache (cleared when the app
+    // is updated) so the first transcription after a launch does not compile
+    // them again. Runs before any model loads, as the backend requires.
+    jclass contextClass = env->GetObjectClass(applicationContext);
+    jmethodID getCodeCacheDir = env->GetMethodID(contextClass, "getCodeCacheDir", "()Ljava/io/File;");
+    jobject dir = getCodeCacheDir ? env->CallObjectMethod(applicationContext, getCodeCacheDir) : nullptr;
+    if (dir && !env->ExceptionCheck()) {
+        jclass fileClass = env->GetObjectClass(dir);
+        jmethodID getAbsolutePath = env->GetMethodID(fileClass, "getAbsolutePath", "()Ljava/lang/String;");
+        auto path = (jstring) env->CallObjectMethod(dir, getAbsolutePath);
+        if (path && !env->ExceptionCheck()) {
+            const char *chars = env->GetStringUTFChars(path, nullptr);
+            ggml_backend_vk_set_pipeline_cache_path((std::string(chars) + "/rnwhisper-vulkan-pipelines.bin").c_str());
+            env->ReleaseStringUTFChars(path, chars);
+        }
+    }
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+    }
+#endif
 }
 
-// Hexagon is the only GPU-class backend the Android build can carry, and only
-// the rnwhisper_*_hexagon variant compiles it in (android/src/main/CMakeLists.txt).
-// whisper.cpp takes the first GPU device the registry reports, so this mirrors
-// whisper_backend_init_gpu.
-static bool hexagonDeviceAvailable(std::string &reasonNoGPU) {
-#ifdef GGML_USE_HEXAGON
-    if (ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) != nullptr) {
+// Hexagon and Vulkan are the GPU-class backends the Android build can carry,
+// each only in its own variant (android/src/main/CMakeLists.txt).
+// whisper.cpp takes the first GPU or integrated GPU device the registry
+// reports, so this mirrors whisper_backend_init_gpu. Phone GPUs share memory
+// with the CPU, and ggml-vulkan reports them as integrated GPUs.
+static ggml_backend_dev_t firstGpuDevice() {
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+        if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            return dev;
+        }
+    }
+    return nullptr;
+}
+
+static bool gpuDeviceAvailable(std::string &reasonNoGPU) {
+#if defined(GGML_USE_HEXAGON) || defined(GGML_USE_VULKAN)
+    if (firstGpuDevice() != nullptr) {
         return true;
     }
+#endif
+#if defined(GGML_USE_HEXAGON)
     reasonNoGPU = "No Hexagon NPU device found";
+#elif defined(GGML_USE_VULKAN)
+    reasonNoGPU = "No Vulkan device found";
 #else
-    reasonNoGPU = "Hexagon backend not available in this build";
+    reasonNoGPU = "No GPU backend in this build";
 #endif
     return false;
 }
@@ -642,7 +683,8 @@ WhisperContextInitResult hostInitWhisperContext(
     params.dtw_token_timestamps = false;
     params.flash_attn = options.useFlashAttn;
     params.use_coreml = false;
-    params.use_gpu = options.useGpu && hexagonDeviceAvailable(result.reasonNoGPU);
+    params.use_gpu = options.useGpu && gpuDeviceAvailable(result.reasonNoGPU);
+#ifdef GGML_USE_HEXAGON
     if (params.use_gpu && !params.flash_attn) {
         // whisper.cpp writes the KV caches with ggml_set_rows only on the
         // flash-attention path; the other path uses a transposed ggml_cpy that
@@ -650,6 +692,13 @@ WhisperContextInitResult hostInitWhisperContext(
         __android_log_print(ANDROID_LOG_INFO, kTag, "Hexagon NPU in use, enabling flash attention");
         params.flash_attn = true;
     }
+#endif
+#ifdef GGML_USE_VULKAN
+    if (params.use_gpu) {
+        __android_log_print(ANDROID_LOG_INFO, kTag, "Vulkan device in use: %s",
+                            ggml_backend_dev_description(firstGpuDevice()));
+    }
+#endif
 
     std::string modelPath = options.filePath;
     if (isRemoteUrl(modelPath)) {
@@ -682,13 +731,14 @@ WhisperContextInitResult hostInitWhisperContext(
 
     result.context = initContext(params);
     if (!result.context && params.use_gpu) {
-        // The NPU can refuse memory (e.g. the DSP fails to map a buffer); the
-        // model still works on the CPU, so retry there instead of failing.
-        __android_log_print(ANDROID_LOG_WARN, kTag, "Hexagon NPU init failed, retrying on CPU");
+        // The NPU or GPU can refuse memory (e.g. the DSP fails to map a
+        // buffer); the model still works on the CPU, so retry there instead
+        // of failing.
+        __android_log_print(ANDROID_LOG_WARN, kTag, "GPU init failed, retrying on CPU");
         params.use_gpu = false;
         params.flash_attn = options.useFlashAttn;
         result.context = initContext(params);
-        result.reasonNoGPU = "Failed to initialize on the Hexagon NPU (see logcat)";
+        result.reasonNoGPU = "Failed to initialize on the GPU (see logcat)";
     }
     result.gpu = result.context != nullptr && params.use_gpu;
 
