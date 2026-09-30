@@ -1,0 +1,9 @@
+# Upstream pin for the vendored tree under vendor/.
+#
+# Edit WHISPER_CPP_REF (tag, branch or commit), then run `yarn sync:vendor`.
+# The script resolves WHISPER_CPP_REF to WHISPER_CPP_COMMIT and rewrites that
+# line itself. See vendor/README.md.
+
+WHISPER_CPP_REPO=https://github.com/ggml-org/whisper.cpp
+WHISPER_CPP_REF=1d549b3cecc2d98d76d4ddc2edca0d1512f5d7a0
+WHISPER_CPP_COMMIT=1d549b3cecc2d98d76d4ddc2edca0d1512f5d7a0

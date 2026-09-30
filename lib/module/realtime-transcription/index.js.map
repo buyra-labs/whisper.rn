@@ -1,0 +1,1 @@
+{"version":3,"names":["RealtimeTranscriber","SliceManager","RingBuffer","RingBufferVad","VAD_PRESETS"],"sourceRoot":"../../../src","sources":["realtime-transcription/index.ts"],"mappings":"AAAA;AACA,SAASA,mBAAmB,QAAQ,uBAAuB;;AAE3D;AACA,SAASC,YAAY,QAAQ,gBAAgB;;AAE7C;AACA,SAASC,UAAU,QAAQ,cAAc;AACzC,SAASC,aAAa,QAAQ,iBAAiB;AA2B/C;AACA,SAASC,WAAW,QAAQ,SAAS"}

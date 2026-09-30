@@ -1,0 +1,1 @@
+{"version":3,"names":["_RealtimeTranscriber","require","_SliceManager","_RingBuffer","_RingBufferVad","_types"],"sourceRoot":"../../../src","sources":["realtime-transcription/index.ts"],"mappings":";;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;AACA,IAAAA,oBAAA,GAAAC,OAAA;AAGA,IAAAC,aAAA,GAAAD,OAAA;AAGA,IAAAE,WAAA,GAAAF,OAAA;AACA,IAAAG,cAAA,GAAAH,OAAA;AA4BA,IAAAI,MAAA,GAAAJ,OAAA"}
