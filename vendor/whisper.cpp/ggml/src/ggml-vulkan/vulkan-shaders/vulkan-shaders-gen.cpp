@@ -348,12 +348,18 @@ compile_count_guard acquire_compile_slot() {
 }
 
 void string_to_spv_func(std::string name, std::string in_path, std::string out_path, std::map<std::string, std::string> defines, bool coopmat, bool dep_file, compile_count_guard slot) {
-    std::string target_env = (name.find("_cm2") != std::string::npos) ? "--target-env=vulkan1.3" : "--target-env=vulkan1.2";
+    // SPIR-V 1.4 rather than 1.5 so the shaders also load on Vulkan 1.1
+    // devices with VK_KHR_spirv_1_4 (e.g. Mali-G78 on Android). The Vulkan 1.2
+    // environment stays because shaderc's optimizer rejects SPIR-V 1.4 under
+    // Vulkan 1.1; the output validates for vulkan1.1spv1.4.
+    const bool cm2 = name.find("_cm2") != std::string::npos;
+    std::string target_env = cm2 ? "--target-env=vulkan1.3" : "--target-env=vulkan1.2";
+    std::string target_spv = cm2 ? "--target-spv=spv1.6" : "--target-spv=spv1.4";
 
     #ifdef _WIN32
-        std::vector<std::string> cmd = {GLSLC, "-fshader-stage=compute", target_env, "\"" + in_path + "\"", "-o", "\"" + out_path + "\""};
+        std::vector<std::string> cmd = {GLSLC, "-fshader-stage=compute", target_env, target_spv, "\"" + in_path + "\"", "-o", "\"" + out_path + "\""};
     #else
-        std::vector<std::string> cmd = {GLSLC, "-fshader-stage=compute", target_env, in_path, "-o", out_path};
+        std::vector<std::string> cmd = {GLSLC, "-fshader-stage=compute", target_env, target_spv, in_path, "-o", out_path};
     #endif
 
     // disable spirv-opt for coopmat shaders for https://github.com/ggml-org/llama.cpp/issues/10734
