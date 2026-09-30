@@ -22,6 +22,8 @@
 
 #if defined(__ANDROID__)
 #include <android/log.h>
+#include <dlfcn.h>
+#include <unistd.h>
 #endif
 
 using namespace facebook;
@@ -1349,7 +1351,125 @@ std::vector<float> readWaveAudio(const std::string &pathOrBase64) {
     return decodeWaveBytes(rnwhisper_jsi::hostLoadFileBytes(pathOrBase64));
 }
 
-// Runs whisper_full_parallel and records how long it took, whisper.cpp's per-stage averages and the number of decoded tokens.
+#if defined(__ANDROID__)
+// Android's performance hint API (ADPF): the transcribing thread reports each
+// decoder token as a work period against a short target, which lets the power
+// HAL raise CPU clocks (API 33+) and, from API 35 when the model runs on the
+// GPU, GPU clocks while a transcription runs. Devices whose power HAL has no
+// hint sessions return none, and nothing is reported. The NDK functions are
+// looked up at runtime because the library supports older API levels.
+class AdpfWorkHint {
+public:
+    explicit AdpfWorkHint(bool gpu) {
+        const Api *api = loadApi();
+        if (api == nullptr) {
+            return;
+        }
+        void *manager = api->getManager();
+        const int32_t tid = gettid();
+        session = manager ? api->createSession(manager, &tid, 1, kTargetNanos) : nullptr;
+        reportGpu = gpu && api->reportActualWorkDuration2 != nullptr;
+        periodStart = nowNanos();
+    }
+
+    ~AdpfWorkHint() {
+        if (session != nullptr) {
+            loadApi()->closeSession(session);
+        }
+    }
+
+    bool active() const { return session != nullptr; }
+
+    // whisper_full_params::logits_filter_callback: runs once per decoder
+    // token, so the time since the previous call is that token's work (the
+    // first period also covers the encoder).
+    static void onToken(whisper_context *, whisper_state *, const whisper_token_data *, int, float *, void *userData) {
+        static_cast<AdpfWorkHint *>(userData)->reportPeriod();
+    }
+
+private:
+    // A token every 8 ms: below what current phones reach, so the system
+    // keeps clocks up while dictation is being transcribed.
+    static constexpr int64_t kTargetNanos = 8'000'000;
+
+    struct Api {
+        void *(*getManager)();
+        void *(*createSession)(void *, const int32_t *, size_t, int64_t);
+        int (*reportActualWorkDuration)(void *, int64_t);
+        void (*closeSession)(void *);
+        // API 35+
+        int (*reportActualWorkDuration2)(void *, void *);
+        void *(*workDurationCreate)();
+        void (*workDurationRelease)(void *);
+        void (*setWorkPeriodStart)(void *, int64_t);
+        void (*setTotalDuration)(void *, int64_t);
+        void (*setCpuDuration)(void *, int64_t);
+        void (*setGpuDuration)(void *, int64_t);
+    };
+
+    static const Api *loadApi() {
+        static const Api *api = []() -> const Api * {
+            void *lib = dlopen("libandroid.so", RTLD_NOW);
+            if (lib == nullptr) {
+                return nullptr;
+            }
+            static Api loaded{};
+            loaded.getManager = (void *(*)())dlsym(lib, "APerformanceHint_getManager");
+            loaded.createSession = (void *(*)(void *, const int32_t *, size_t, int64_t))dlsym(lib, "APerformanceHint_createSession");
+            loaded.reportActualWorkDuration = (int (*)(void *, int64_t))dlsym(lib, "APerformanceHint_reportActualWorkDuration");
+            loaded.closeSession = (void (*)(void *))dlsym(lib, "APerformanceHint_closeSession");
+            if (!loaded.getManager || !loaded.createSession || !loaded.reportActualWorkDuration || !loaded.closeSession) {
+                return nullptr;
+            }
+            loaded.workDurationCreate = (void *(*)())dlsym(lib, "AWorkDuration_create");
+            loaded.workDurationRelease = (void (*)(void *))dlsym(lib, "AWorkDuration_release");
+            loaded.setWorkPeriodStart = (void (*)(void *, int64_t))dlsym(lib, "AWorkDuration_setWorkPeriodStartTimestampNanos");
+            loaded.setTotalDuration = (void (*)(void *, int64_t))dlsym(lib, "AWorkDuration_setActualTotalDurationNanos");
+            loaded.setCpuDuration = (void (*)(void *, int64_t))dlsym(lib, "AWorkDuration_setActualCpuDurationNanos");
+            loaded.setGpuDuration = (void (*)(void *, int64_t))dlsym(lib, "AWorkDuration_setActualGpuDurationNanos");
+            loaded.reportActualWorkDuration2 = (int (*)(void *, void *))dlsym(lib, "APerformanceHint_reportActualWorkDuration2");
+            if (!loaded.workDurationCreate || !loaded.workDurationRelease || !loaded.setWorkPeriodStart ||
+                !loaded.setTotalDuration || !loaded.setCpuDuration || !loaded.setGpuDuration) {
+                loaded.reportActualWorkDuration2 = nullptr;
+            }
+            return &loaded;
+        }();
+        return api;
+    }
+
+    static int64_t nowNanos() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    void reportPeriod() {
+        const int64_t now = nowNanos();
+        const int64_t duration = now - periodStart;
+        const Api *api = loadApi();
+        if (reportGpu) {
+            // The thread waits on the GPU for most of a token, and the GPU is
+            // busy for most of it; both are reported as the whole period.
+            void *work = api->workDurationCreate();
+            api->setWorkPeriodStart(work, periodStart);
+            api->setTotalDuration(work, duration);
+            api->setCpuDuration(work, duration);
+            api->setGpuDuration(work, duration);
+            api->reportActualWorkDuration2(session, work);
+            api->workDurationRelease(work);
+        } else {
+            api->reportActualWorkDuration(session, duration);
+        }
+        periodStart = now;
+    }
+
+    void *session = nullptr;
+    bool reportGpu = false;
+    int64_t periodStart = 0;
+};
+#endif
+
+// Runs whisper_full_parallel with ADPF hints on Android and records how long
+// it took, whisper.cpp's per-stage averages and the number of decoded tokens.
 int runWhisperFull(
     whisper_context *context,
     whisper_full_params params,
@@ -1358,7 +1478,15 @@ int runWhisperFull(
     bool gpu,
     TranscribeTimings &timings) {
     whisper_reset_timings(context);
+#if defined(__ANDROID__)
+    AdpfWorkHint hint(gpu);
+    if (hint.active() && params.logits_filter_callback == nullptr) {
+        params.logits_filter_callback = AdpfWorkHint::onToken;
+        params.logits_filter_callback_user_data = &hint;
+    }
+#else
     (void)gpu;
+#endif
     const auto started = std::chrono::steady_clock::now();
     const int code = whisper_full_parallel(context, params, audio.data(), static_cast<int>(audio.size()), nProcessors);
     timings.totalMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
