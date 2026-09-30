@@ -6359,17 +6359,25 @@ static const std::vector<std::string> non_speech_tokens = {
     "♪♪♪","♩", "♪", "♫", "♬", "♭", "♮", "♯"
 };
 
-static void whisper_compute_logprobs(
+// With exps, also leaves exp(logit - max) in exps and returns the sum's
+// inverse, so the probabilities need no second pass of expf.
+static float whisper_compute_logprobs(
                 const std::vector<float> & logits,
                               const int    n_logits,
-                      std::vector<float> & logprobs) {
+                      std::vector<float> & logprobs,
+                      std::vector<float> * exps = nullptr) {
     const float logit_max = *std::max_element(logits.begin(), logits.end());
     float logsumexp = 0.0f;
     for (int i = 0; i < n_logits; ++i) {
         if (logits[i] > -INFINITY) {
-            logsumexp += expf(logits[i] - logit_max);
+            const float e = expf(logits[i] - logit_max);
+            logsumexp += e;
+            if (exps) {
+                (*exps)[i] = e;
+            }
         }
     }
+    const float inv_sum = 1.0f/logsumexp;
     logsumexp = logf(logsumexp) + logit_max;
 
     for (int i = 0; i < n_logits; ++i) {
@@ -6379,6 +6387,8 @@ static void whisper_compute_logprobs(
             logprobs[i] = -INFINITY;
         }
     }
+
+    return inv_sum;
 }
 
 static void whisper_compute_probs(
@@ -6410,6 +6420,7 @@ static void whisper_process_logits(
 
     const bool is_initial = tokens_cur.size() == 0;
     const int  n_logits   = vocab.id_to_token.size();
+    float probs_inv_sum = 0.0f;
 
     WHISPER_ASSERT(n_logits == ctx.vocab.n_vocab);
 
@@ -6562,7 +6573,7 @@ static void whisper_process_logits(
         }
 
         // populate the logprobs array (log_softmax)
-        whisper_compute_logprobs(logits, n_logits, logprobs);
+        probs_inv_sum = whisper_compute_logprobs(logits, n_logits, logprobs, &probs);
 
         // if sum of probability over timestamps is above any other token, sample timestamp
         // ref: https://github.com/openai/whisper/blob/0b1ba3d46ebf7fe6f953acfd8cad62a4f851b49f/whisper/decoding.py#L431-L437
@@ -6593,6 +6604,7 @@ static void whisper_process_logits(
                 }
             } else {
                 if (params.n_grammar_rules > 0) {
+                    probs_inv_sum = 0.0f;
                     whisper_suppress_invalid_grammar(ctx, params, logits, decoder.grammar);
 
                     // populate the logprobs array (log_softmax)
@@ -6620,7 +6632,14 @@ static void whisper_process_logits(
     }
 
     // compute probs
-    whisper_compute_probs(logits, n_logits, logprobs, probs);
+    if (probs_inv_sum > 0.0f) {
+        // probs holds exp(logit - max) from whisper_compute_logprobs
+        for (int i = 0; i < n_logits; ++i) {
+            probs[i] = logits[i] == -INFINITY ? 0.0f : probs[i]*probs_inv_sum;
+        }
+    } else {
+        whisper_compute_probs(logits, n_logits, logprobs, probs);
+    }
 
 #if 0
     // print first 100 logits - token string : logit
