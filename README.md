@@ -1,5 +1,36 @@
 # whisper.rn
 
+> **Buyra fork.** Buyra's app depends on this fork of whisper.rn 0.8.0-rc.1,
+> pinned by commit. It adds an Android GPU variant tuned for Arm Mali GPUs;
+> everything else is upstream. The changes, each a commit on top of the
+> published package:
+>
+> - ggml's Vulkan backend (vendored from the same whisper.cpp commit) running
+>   on Vulkan 1.1 Android GPUs, with Mali kernels for matrix products,
+>   mat-vec, softmax and conversions, planar q5_0 weights, fused
+>   bias/residual/GELU/LayerNorm, an early first submit per graph, a
+>   persistent pipeline cache, and an option to build only some tensor types'
+>   shaders;
+> - whisper.cpp: the single-token decoder graph reused between tokens, the
+>   encoder's attention probabilities cast to f16 as a graph node, and one
+>   `expf` pass in sampling;
+> - `rnwhisper_v8fp16_va_2_vulkan`, compiled from these sources in every app
+>   build (f32/f16/q5_0 shaders, no flash attention, the NDK's glslc; needs a
+>   host C++ compiler and network access for the Khronos headers). The CPU
+>   and Hexagon variants and the iOS framework are the upstream release's
+>   prebuilts (`install/native-artifacts.json`), so the whisper.cpp changes
+>   reach the Vulkan variant only;
+> - `RNWhisper.acceleration()`: the variant is chosen once per process —
+>   Hexagon where ggml-hexagon supports the SoC, Vulkan on Mali GPUs of the
+>   Valhall architecture and later, otherwise the CPU — and apps can read the
+>   choice before loading anything;
+> - transcribe options `noTimestamps` and `audioCtx`, `timings` on every
+>   result, and Android performance hint (ADPF) reports per decoder token.
+>
+> Kernel tests: `tools/vulkan-tests/run.sh`. When moving to a new upstream
+> release, rebase these commits onto the new package and re-measure the
+> reference transcription on a Mali phone.
+
 [![Actions Status](https://github.com/mybigday/whisper.rn/workflows/CI/badge.svg)](https://github.com/mybigday/whisper.rn/actions)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![npm](https://img.shields.io/npm/v/whisper.rn.svg)](https://www.npmjs.com/package/whisper.rn/)
