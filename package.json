@@ -41,7 +41,6 @@
     "cmake",
     "vendor",
     "!vendor/whisper.cpp/ggml/src/ggml-cuda",
-    "!vendor/whisper.cpp/ggml/src/ggml-vulkan",
     "!vendor/whisper.cpp/ggml/src/ggml-webgpu",
     "*.podspec",
     "!lib/typescript/example",
