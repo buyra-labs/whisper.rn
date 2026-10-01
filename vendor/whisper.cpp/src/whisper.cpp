@@ -3007,11 +3007,10 @@ static bool whisper_decode_internal(
 
         // Reuse the allocated graph when only the inputs differ. The key is what
         // whisper_build_graph_decoder's shape depends on.
-        static const bool reuse_disabled = getenv("WHISPER_NO_GRAPH_REUSE") != nullptr;
         auto & cached = wstate.decoder_graph;
         const int32_t n_audio_ctx = wstate.exp_n_audio_ctx > 0 ? wstate.exp_n_audio_ctx : hparams.n_audio_ctx;
         ggml_cgraph * gf = nullptr;
-        if (!reuse_disabled && cached.gf != nullptr && cached.n_tokens == n_tokens && cached.n_kv == (int32_t) wstate.kv_self.n &&
+        if (cached.gf != nullptr && cached.n_tokens == n_tokens && cached.n_kv == (int32_t) wstate.kv_self.n &&
             cached.n_audio_ctx == n_audio_ctx && cached.save_alignment_heads_QKs == save_alignment_heads_QKs) {
             gf = cached.gf;
         } else {
