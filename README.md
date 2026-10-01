@@ -1,7 +1,8 @@
 # whisper.rn
 
-> **Buyra fork.** Buyra's app depends on this fork of whisper.rn 0.8.0-rc.1,
-> pinned by commit. It adds an Android GPU variant tuned for Arm Mali GPUs;
+> **Buyra fork.** Buyra's app depends on this fork of whisper.rn 0.8.0-rc.1
+> through the tarball each `v*-buyra.*` tag publishes as a GitHub release
+> (`.github/workflows/release.yml`); bump the `-buyra.N` version to release. It adds an Android GPU variant tuned for Arm Mali GPUs;
 > everything else is upstream. The changes, each a commit on top of the
 > published package:
 >
