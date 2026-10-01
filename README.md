@@ -22,9 +22,10 @@
 >   prebuilts (`install/native-artifacts.json`), so the whisper.cpp changes
 >   reach the Vulkan variant only;
 > - `RNWhisper.acceleration()`: the variant is chosen once per process —
->   Hexagon where ggml-hexagon supports the SoC, Vulkan on Mali GPUs of the
->   Valhall architecture and later, otherwise the CPU — and apps can read the
->   choice before loading anything;
+>   Hexagon on SoCs with an HTP library here (Snapdragon 8 Gen 2 / SM8550 and
+>   later), Vulkan on Mali GPUs of the Valhall architecture and later,
+>   otherwise the CPU — and apps can read the choice before loading anything
+>   (`android/src/test` covers the rules);
 > - transcribe options `noTimestamps` and `audioCtx`, `timings` on every
 >   result, and Android performance hint (ADPF) reports per decoder token.
 >

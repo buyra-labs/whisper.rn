@@ -48,6 +48,7 @@
     "!ios/rnwhisper.xcframework/**",
     "!android/.cxx",
     "!android/build",
+    "!android/src/test",
     "!android/gradle",
     "!android/gradlew",
     "!android/gradlew.bat",

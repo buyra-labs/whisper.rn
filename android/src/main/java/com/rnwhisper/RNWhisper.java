@@ -40,15 +40,17 @@ public class RNWhisper {
     "libggml-htp-v79.so",
     "libggml-htp-v81.so"
   };
-  // Same heuristics as llama.rn: SoCs whose HTP is known to work with ggml-hexagon,
-  // plus a generic Snapdragon 8-series match when the device also reports Qualcomm.
+  // SoCs whose HTP generation has a library in HTP_LIBS (v73 and later:
+  // Snapdragon 8 Gen 2 / SM8550 onwards). Starts from llama.rn's heuristics,
+  // without the 8 Gen 1 (SM8450, "taro", HTP v69), which ships no library here.
   private static final Pattern QUALCOMM_HINT_PATTERN =
     Pattern.compile("(adreno|qcom|qualcomm|snapdragon)", Pattern.CASE_INSENSITIVE);
   private static final Pattern KNOWN_HEXAGON_SOC_PATTERN =
-    Pattern.compile("\\b(SM8450|SM8550|SM8635|SM8650|SM8750|SM8845|SM8850)\\b");
-  private static final Pattern SNAPDRAGON_8_SERIES_SOC_PATTERN = Pattern.compile("\\bSM8\\d{3}\\b");
-  private static final Pattern SNAPDRAGON_8_SERIES_NAME_PATTERN = Pattern.compile("SNAPDRAGON\\s*8");
-  private static final Pattern HEXAGON_CODENAME_PATTERN = Pattern.compile("(taro|kalama|pineapple|sun|lanai)");
+    Pattern.compile("\\b(SM8550|SM8635|SM8650|SM8750|SM8845|SM8850)\\b");
+  private static final Pattern SNAPDRAGON_8_SERIES_SOC_PATTERN = Pattern.compile("\\bSM8(\\d{3})\\b");
+  // A newer 8-series SoC not listed above; SM8550 is the first with HTP v73.
+  private static final int FIRST_HTP_V73_SOC = 550;
+  private static final Pattern HEXAGON_CODENAME_PATTERN = Pattern.compile("(kalama|pineapple|sun|lanai)");
 
   // Each variant is a pair of libraries: librnwhisper_jni<suffix>.so, the JNI/JSI
   // wrapper built against the app's React Native, and librnwhisper<suffix>.so,
@@ -342,19 +344,21 @@ public class RNWhisper {
     if (Build.VERSION.SDK_INT >= 31) {
       String socModel = upperOrEmpty(Build.SOC_MODEL);
       if (!socModel.isEmpty()) {
-        if (KNOWN_HEXAGON_SOC_PATTERN.matcher(socModel).find()) {
-          return true;
-        }
-        if (hasQualcommHint &&
-            (SNAPDRAGON_8_SERIES_SOC_PATTERN.matcher(socModel).find() ||
-             SNAPDRAGON_8_SERIES_NAME_PATTERN.matcher(socModel).find())) {
-          return true;
-        }
+        return isHexagonSoc(socModel, hasQualcommHint);
       }
     }
 
     String hardwareHints = lowerOrEmpty(Build.HARDWARE) + " " + lowerOrEmpty(Build.BOARD);
     return hasQualcommHint && HEXAGON_CODENAME_PATTERN.matcher(hardwareHints).find();
+  }
+
+  /** Whether a SoC model (Build.SOC_MODEL, upper case) has an HTP library in HTP_LIBS. */
+  static boolean isHexagonSoc(String socModel, boolean hasQualcommHint) {
+    if (KNOWN_HEXAGON_SOC_PATTERN.matcher(socModel).find()) {
+      return true;
+    }
+    Matcher series = SNAPDRAGON_8_SERIES_SOC_PATTERN.matcher(socModel);
+    return hasQualcommHint && series.find() && Integer.parseInt(series.group(1)) >= FIRST_HTP_V73_SOC;
   }
 
   private static String getCpuFeatures() {
