@@ -16,7 +16,7 @@
 >   encoder's attention probabilities cast to f16 as a graph node, and one
 >   `expf` pass in sampling;
 > - `rnwhisper_v8fp16_va_2_vulkan`, compiled from these sources in every app
->   build (f32/f16/q5_0 shaders, no flash attention, the NDK's glslc and the
+>   build (f32/f16/q5_0/IQ4_NL shaders, no flash attention, the NDK's glslc and the
 >   Khronos headers in `vendor/khronos`; needs a host C++ compiler). The CPU
 >   and Hexagon variants and the iOS framework are the upstream release's
 >   prebuilts (`install/native-artifacts.json`), so the whisper.cpp changes
@@ -29,7 +29,7 @@
 > - transcribe options `noTimestamps` and `audioCtx`, `timings` on every
 >   result, and Android performance hint (ADPF) reports per decoder token.
 >
-> Kernel tests: `tools/vulkan-tests/run.sh`. When moving to a new upstream
+> Kernel tests: `tools/vulkan-tests/run.sh`. IQ4_NL models: `tools/quantize`. When moving to a new upstream
 > release, rebase these commits onto the new package and re-measure the
 > reference transcription on a Mali phone.
 
