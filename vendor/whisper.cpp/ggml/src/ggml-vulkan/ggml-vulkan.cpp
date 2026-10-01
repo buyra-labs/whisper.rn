@@ -5880,7 +5880,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_soft_max_mali_f32, "soft_max_mali_f32", soft_max_mali_f32_len, soft_max_mali_f32_data, "main", 2, 3 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
         ggml_vk_create_pipeline(device, device->pipeline_soft_max_mali_f16, "soft_max_mali_f16", soft_max_mali_f16_len, soft_max_mali_f16_data, "main", 2, 3 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
     }
-    if (device->subgroup_arithmetic) {
+    // The fused LayerNorm reduces through per-subgroup partial sums, which gave
+    // wrong results on Adreno (64/128-lane subgroups); other GPUs keep the
+    // separate NORM, MUL and ADD. GGML_VK_FORCE_MALI_NORM enables it elsewhere,
+    // to test it.
+    if (device->subgroup_arithmetic &&
+        (device->vendor_id == VK_VENDOR_ID_ARM || getenv("GGML_VK_FORCE_MALI_NORM") != nullptr)) {
         ggml_vk_create_pipeline(device, device->pipeline_norm_mul_add_f32, "norm_mul_add_f32", norm_mul_add_f32_len, norm_mul_add_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0}, 1, true);
     }
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_add_f32, "rms_norm_mul_add_f32", rms_norm_mul_add_f32_len, rms_norm_mul_add_f32_data, "main", 5, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 0}, 1, true);

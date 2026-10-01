@@ -13,7 +13,7 @@ ops="MUL_MAT GET_ROWS CPY SOFT_MAX NORM ADD BUYRA_MM_ADD BUYRA_MM_EPILOGUE BUYRA
 for mode in default mali; do
   env=()
   if [ "$mode" = mali ]; then
-    env=(GGML_VK_FORCE_MALI_MM=1 GGML_VK_FORCE_Q5_PLANAR=1 GGML_VK_FORCE_MALI_SOFTMAX=1)
+    env=(GGML_VK_FORCE_MALI_MM=1 GGML_VK_FORCE_Q5_PLANAR=1 GGML_VK_FORCE_MALI_SOFTMAX=1 GGML_VK_FORCE_MALI_NORM=1)
   fi
   for op in $ops; do
     result="$(env "${env[@]}" "$build/test-backend-ops" test -b Vulkan0 -o "$op" 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g')"
