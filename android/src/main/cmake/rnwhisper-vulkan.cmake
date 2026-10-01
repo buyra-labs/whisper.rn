@@ -3,15 +3,14 @@
 # includes this file for that variant.
 #
 # Build host requirements: a host C/C++ compiler (the shader generator runs on
-# the build machine) and network access for the Khronos headers. Shaders are
-# compiled with the NDK's glslc, which covers the reduced shader set (it lacks
-# only ggml's optional cooperative-matrix, integer-dot, bf16 and fp8 families).
+# the build machine). Shaders are compiled with the NDK's glslc, which covers
+# the reduced shader set (it lacks only ggml's optional cooperative-matrix,
+# integer-dot, bf16 and fp8 families).
 include_guard(GLOBAL)
 # Ninja rewrites the shader DEPFILEs relative to the build directory.
 cmake_policy(SET CMP0116 NEW)
 
 include(ExternalProject)
-include(FetchContent)
 
 set(RNWHISPER_VULKAN_SOURCE_DIR "${RNWHISPER_WHISPER_CPP_DIR}/ggml/src/ggml-vulkan")
 
@@ -21,20 +20,9 @@ set(RNWHISPER_VULKAN_SOURCE_DIR "${RNWHISPER_WHISPER_CPP_DIR}/ggml/src/ggml-vulk
 set(RNWHISPER_VULKAN_SHADER_TYPES "f32,f16,q5_0")
 
 # The NDK's Vulkan headers predate what ggml-vulkan uses and ship no vulkan.hpp.
-set(RNWHISPER_VULKAN_KHRONOS_TAG vulkan-sdk-1.4.357.0)
-FetchContent_Declare(rnwhisper_vulkan_headers
-    URL https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/${RNWHISPER_VULKAN_KHRONOS_TAG}.tar.gz
-    URL_HASH SHA256=e87dce08116151f6b6d7de6b6faf41498e87e6cf848ff16fa3bd5402190ad4a3
-    SOURCE_SUBDIR none
-)
-FetchContent_Declare(rnwhisper_spirv_headers
-    URL https://github.com/KhronosGroup/SPIRV-Headers/archive/refs/tags/${RNWHISPER_VULKAN_KHRONOS_TAG}.tar.gz
-    URL_HASH SHA256=4d703067a7e06331ccb37bdfed3f9b7879cc61969a2689ae95c95db34a47ff07
-    SOURCE_SUBDIR none
-)
-# SOURCE_SUBDIR points at a directory without a CMakeLists.txt, so
-# FetchContent_MakeAvailable only downloads and never adds the projects.
-FetchContent_MakeAvailable(rnwhisper_vulkan_headers rnwhisper_spirv_headers)
+# vendor/khronos holds the headers ggml-vulkan includes, from Vulkan-Headers and
+# SPIRV-Headers vulkan-sdk-1.4.357.0, so the build needs no network access.
+set(RNWHISPER_KHRONOS_DIR "${RNWHISPER_ROOT_DIR}/vendor/khronos")
 
 find_program(RNWHISPER_GLSLC glslc
     HINTS "${ANDROID_NDK}/shader-tools/${ANDROID_HOST_TAG}"
@@ -119,8 +107,8 @@ function(rnwhisper_add_vulkan_backend target)
         ${generated}
     )
     target_include_directories(${target} BEFORE PRIVATE
-        ${rnwhisper_vulkan_headers_SOURCE_DIR}/include
-        ${rnwhisper_spirv_headers_SOURCE_DIR}/include
+        ${RNWHISPER_KHRONOS_DIR}/Vulkan-Headers/include
+        ${RNWHISPER_KHRONOS_DIR}/SPIRV-Headers/include
         ${CMAKE_CURRENT_BINARY_DIR}
     )
     # GGML_BACKEND_* export the backend API (the JNI wrapper calls

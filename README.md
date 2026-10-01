@@ -16,8 +16,8 @@
 >   encoder's attention probabilities cast to f16 as a graph node, and one
 >   `expf` pass in sampling;
 > - `rnwhisper_v8fp16_va_2_vulkan`, compiled from these sources in every app
->   build (f32/f16/q5_0 shaders, no flash attention, the NDK's glslc; needs a
->   host C++ compiler and network access for the Khronos headers). The CPU
+>   build (f32/f16/q5_0 shaders, no flash attention, the NDK's glslc and the
+>   Khronos headers in `vendor/khronos`; needs a host C++ compiler). The CPU
 >   and Hexagon variants and the iOS framework are the upstream release's
 >   prebuilts (`install/native-artifacts.json`), so the whisper.cpp changes
 >   reach the Vulkan variant only;
