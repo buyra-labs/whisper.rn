@@ -7,7 +7,7 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 build="${1:-$here/build}"
 cmake -S "$here" -B "$build" -DCMAKE_BUILD_TYPE=Release \
-  -DGGML_VULKAN_SHADER_TYPES=f32,f16,q5_0 -DGGML_VULKAN_NO_FLASH_ATTN=ON > /dev/null
+  -DGGML_VULKAN_SHADER_TYPES=f32,f16,q5_0,iq4_nl -DGGML_VULKAN_NO_FLASH_ATTN=ON > /dev/null
 cmake --build "$build" --target test-backend-ops -j > /dev/null
 ops="MUL_MAT GET_ROWS CPY SOFT_MAX NORM ADD BUYRA_MM_ADD BUYRA_MM_EPILOGUE BUYRA_ATTN BUYRA_SOFT_MAX_F16 BUYRA_LAYER_NORM BUYRA_CROSS_ATTN"
 for mode in default mali; do

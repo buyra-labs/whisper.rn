@@ -15,9 +15,9 @@ include(ExternalProject)
 set(RNWHISPER_VULKAN_SOURCE_DIR "${RNWHISPER_WHISPER_CPP_DIR}/ggml/src/ggml-vulkan")
 
 # Only the shaders whisper's models need: f32 activations, f16 weights and
-# caches, q5_0 weights. Ops on other types and flash attention run on the CPU
-# backend (see "Allow building ggml-vulkan with a reduced shader set").
-set(RNWHISPER_VULKAN_SHADER_TYPES "f32,f16,q5_0")
+# caches, q5_0 and IQ4_NL weights. Ops on other types and flash attention run
+# on the CPU backend (see "Allow building ggml-vulkan with a reduced shader set").
+set(RNWHISPER_VULKAN_SHADER_TYPES "f32,f16,q5_0,iq4_nl")
 
 # The NDK's Vulkan headers predate what ggml-vulkan uses and ship no vulkan.hpp.
 # vendor/khronos holds the headers ggml-vulkan includes, from Vulkan-Headers and

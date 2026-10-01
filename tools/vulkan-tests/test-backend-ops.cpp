@@ -9043,8 +9043,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 768, n, 3072, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 51865, n, 768, {1, 1}, {1, 1}));
     }
-    // Buyra: decoder products (one token, fused ADDs) and the 4-token prompt, f16 and q5_0.
-    for (ggml_type t : {GGML_TYPE_F16, GGML_TYPE_Q5_0}) {
+    // Buyra: decoder products (one token, fused ADDs) and the 4-token prompt, f16, q5_0 and IQ4_NL.
+    for (ggml_type t : {GGML_TYPE_F16, GGML_TYPE_Q5_0, GGML_TYPE_IQ4_NL}) {
         for (int n_adds : {0, 1, 2}) {
             test_cases.emplace_back(new test_buyra_mm_add(t, 768, 1, 768, n_adds));
         }
@@ -9058,10 +9058,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (auto pt : std::vector<std::pair<int64_t, int64_t>>{{1500, 1}, {1500, 4}, {100, 1}, {130, 3}, {7, 2}}) {
         test_cases.emplace_back(new test_buyra_cross_attn(pt.first, pt.second));
     }
-    for (ggml_type t : {GGML_TYPE_F16, GGML_TYPE_Q5_0}) {
+    for (ggml_type t : {GGML_TYPE_F16, GGML_TYPE_Q5_0, GGML_TYPE_IQ4_NL}) {
         for (int mode : {0, 1, 2}) {
             test_cases.emplace_back(new test_buyra_mm_epilogue(t, 768, 64, 768, mode));
-            test_cases.emplace_back(new test_buyra_mm_epilogue(t, 96, 20, 1030, mode));
+            if (t != GGML_TYPE_IQ4_NL) { // K is not a multiple of IQ4_NL's 32-weight blocks
+                test_cases.emplace_back(new test_buyra_mm_epilogue(t, 96, 20, 1030, mode));
+            }
         }
         test_cases.emplace_back(new test_buyra_mm_epilogue(t, 3072, 300, 768, 2));
         test_cases.emplace_back(new test_buyra_mm_epilogue(t, 768, 4, 768, 0));

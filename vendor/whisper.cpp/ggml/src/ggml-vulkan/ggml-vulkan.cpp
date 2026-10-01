@@ -8602,6 +8602,14 @@ static bool ggml_vk_uses_q5_planar(const ggml_tensor * t) {
     return ggml_vk_is_q5_planar(t) || (t != nullptr && ggml_vk_is_q5_planar(t->view_src));
 }
 
+// Quantized weights the Mali matmul takes after dequantizing them to f16:
+// planar q5_0, and IQ4_NL (4.5 bits per weight, whose weights ggml-hexagon
+// also runs, so one model file can serve both Android accelerators).
+static bool ggml_vk_mali_dequant_src0(const vk_device & device, const ggml_tensor * t) {
+    return ggml_vk_is_q5_planar(t) ||
+           (device->mali_mm && t->type == GGML_TYPE_IQ4_NL && ggml_is_contiguous(t));
+}
+
 // ggml's block_q5_0: d (f16) at 0, qh (4 bytes) at 2, qs (16 bytes) at 6.
 static constexpr size_t Q5_0_BLOCK = 22, Q5_0_D = 0, Q5_0_QH = 2, Q5_0_QS = 6;
 
@@ -9881,14 +9889,15 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // stride padded to 8 so every row starts 16-byte aligned.
     const uint64_t src0_offset = src0_uma ? qx_buf_offset : vk_tensor_offset(src0) + src0->view_offs;
     const uint64_t src1_offset = src1_uma ? qy_buf_offset : vk_tensor_offset(src1) + src1->view_offs;
-    // Planar q5_0 is dequantized to f16 first, and then counts as f16.
+    // Planar q5_0 and IQ4_NL are dequantized to f16 first, and then count as f16.
     const bool x_planar = ggml_vk_is_q5_planar(src0);
-    const bool use_mali_mm = ctx->device->pipeline_matmul_mali && (src0->type == GGML_TYPE_F16 || x_planar) &&
+    const bool x_mali_dequant = ggml_vk_mali_dequant_src0(ctx->device, src0);
+    const bool use_mali_mm = ctx->device->pipeline_matmul_mali && (src0->type == GGML_TYPE_F16 || x_mali_dequant) &&
                              (ggml_prec)dst->op_params[0] == GGML_PREC_DEFAULT &&
                              ne10 % 2 == 0 && ne01 > 8 && ne11 > 1;
     const uint64_t mali_kpad = use_mali_mm ? ROUNDUP_POW2(ne10, 8) : ne00;
     const bool mali_pad = mali_kpad != ne10;
-    const bool mali_convert_x = use_mali_mm && !x_planar &&
+    const bool mali_convert_x = use_mali_mm && !x_mali_dequant &&
                                 (mali_pad || !ggml_vk_dim01_contiguous(src0) || src0_offset % 16 != 0);
     const bool mali_convert_y = use_mali_mm &&
                                 (mali_pad || src1->type != GGML_TYPE_F16 || !ggml_vk_dim01_contiguous(src1) || src1_offset % 16 != 0);
@@ -9911,7 +9920,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     const bool y_f32_kernel = src1->type == GGML_TYPE_F32 && !y_non_contig;
 
-    bool quantize_y = !x_planar && ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
+    bool quantize_y = !x_mali_dequant && ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
 
     // Check for mmq first
     const std::vector<vk_matmul_pipeline_pair>* mmp_map = quantize_y ? ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, GGML_TYPE_Q8_1, (ggml_prec)dst->op_params[0]) : nullptr;
@@ -9922,7 +9931,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         quantize_y = false;
     }
 
-    const bool qx_needs_dequant = mmp_map == nullptr || x_non_contig || x_planar;
+    const bool qx_needs_dequant = mmp_map == nullptr || x_non_contig || x_mali_dequant;
     const bool qy_needs_dequant = !quantize_y && ((src1->type != f16_type && !y_f32_kernel) || y_non_contig);
 
     if (qx_needs_dequant) {
@@ -17932,7 +17941,7 @@ static int ggml_vk_can_fuse_mali_mm_epilogue(ggml_backend_vk_context * ctx, cons
     const ggml_tensor * src1 = mul->src[1];
     // Only shapes that ggml_vk_mul_mat sends to ggml_vk_mul_mat_q_f16 with the
     // Mali pipeline and without split-k (ggml_vk_mali_split_k).
-    const bool mali_src0 = (src0->type == GGML_TYPE_F16 && ggml_is_contiguous(src0)) || ggml_vk_is_q5_planar(src0);
+    const bool mali_src0 = (src0->type == GGML_TYPE_F16 && ggml_is_contiguous(src0)) || ggml_vk_mali_dequant_src0(ctx->device, src0);
     if (!mali_src0 || src1->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || (ggml_prec) mul->op_params[0] != GGML_PREC_DEFAULT ||
         src0->ne[0] % 2 != 0 || src0->ne[1] <= 8 || src1->ne[1] < 16 || src0->ne[0] >= 2048 ||
         src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || !ggml_is_contiguous(mul) ||
