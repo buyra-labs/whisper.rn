@@ -1,0 +1,33 @@
+# Publishes the package tarball that Buyra's app installs. npm refuses git
+# dependencies by default, so the app pins this release asset's URL and the
+# lockfile pins its integrity. lib/ is committed, so packing needs no build.
+name: Release
+
+on:
+  push:
+    tags: ['v*-buyra.*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check the tag matches package.json
+        run: test "v$(node -p "require('./package.json').version")" = "$GITHUB_REF_NAME"
+      - name: Pack
+        run: npm pack --ignore-scripts
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tarball="whisper.rn-${GITHUB_REF_NAME#v}.tgz"
+          sha256sum "$tarball" > "$tarball.sha256"
+          gh release create "$GITHUB_REF_NAME" "$tarball" "$tarball.sha256" \
+            --title "$GITHUB_REF_NAME" \
+            --notes "whisper.rn ${GITHUB_REF_NAME#v} for Buyra, packed from $GITHUB_SHA."
