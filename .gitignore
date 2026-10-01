@@ -4,3 +4,4 @@ android/.cxx/
 android/src/main/jniLibs/
 ios/rnwhisper.xcframework/
 tools/vulkan-tests/build/
+tools/quantize/build/
